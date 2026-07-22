@@ -1,0 +1,49 @@
+{
+  "name": "Red Cloud Shore",
+  "type": "web",
+  "entry": "index.html",
+  "description": "Woodblock seascape: swell rolling in along the painted surf lines, foam running up the coral sand, salmon cumulus drifting, birds over the water",
+  "preview": "media/plate.png",
+  "audio": false,
+  "cursor": true,
+  "properties": {
+    "horizon": 0.524,
+    "seaAngle": 100,
+    "shoreRef": [0.4, 0.93],
+    "bend": 1.07,
+    "bendEdge": 0.42,
+    "shoreTheta": 0.56,
+
+    "swell": 0.007,
+    "waveSpeed": 0.72,
+    "waveLength": 0.2,
+    "foamLength": 0.118,
+    "shallowGain": 0.4,
+    "foamGain": 0.65,
+
+    "foamReach": 0.72,
+    "runFeather": 0.42,
+    "runSpeed": 0.62,
+    "runStep": 0.02,
+    "lipGain": 0.7,
+
+    "cloudDrift": 0.011,
+    "farCloudScale": 0.3,
+    "cloudDeform": 0.0016,
+    "skyFade": [0.47, 0.5],
+    "landLine": [0.318, 0.452],
+    "sunPos": [0.6963, 0.1303],
+    "sunGuard": 0.05,
+
+    "birds": 6,
+    "birdBand": [0.33, 0.6],
+    "birdSpeed": 0.7,
+    "birdSize": 1.5,
+
+    "paper": 0.012,
+    "parallax": 0.006,
+    "vignette": 0,
+    "saturate": 1,
+    "brightness": 1
+  }
+}

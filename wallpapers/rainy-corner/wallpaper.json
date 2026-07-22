@@ -1,0 +1,33 @@
+{
+  "name": "Rainy Corner",
+  "type": "web",
+  "entry": "index.html",
+  "description": "Layered rain over a blue night corner: the wet road ripples and splashes while the traffic light cycles. The taxi stays parked at the kerb.",
+  "preview": "media/plate.png",
+  "audio": false,
+  "cursor": true,
+  "properties": {
+    "rainCount": 950,
+    "rainSlant": 0.26,
+    "rainSpeed": 1,
+    "rainOpacity": 1,
+    "splashChance": 0.22,
+
+    "roadY": 0.884,
+    "rippleStrength": 1,
+    "rippleRate": 1,
+    "wobbleStrength": 1,
+    "shimmerStrength": 1,
+
+    "redSeconds": 12,
+    "greenSeconds": 10,
+    "amberSeconds": 3,
+
+    "cabEnabled": false,
+    "cabGap": 52,
+    "cabGapJitter": 18,
+    "cabStopX": 0.7942,
+    "cabGroundY": 0.89,
+    "cabScale": 1
+  }
+}

@@ -78,6 +78,26 @@ Three things fight you when you do this, and all three are handled in
 - **Cursor tracking** for parallax effects
 - Tray menu, library UI, start-with-Windows
 
+## Bundled wallpapers
+
+Everything in `wallpapers/` ships with the repo and appears in the picker on a
+fresh clone — no import step. Each is a plate (a still image) plus a shader or
+canvas layer that animates only the parts that should move.
+
+| Wallpaper | Type | What moves |
+| --- | --- | --- |
+| **Constellation** | web | Drifting particle network that pulses with the beat — the audio-reactive worked example |
+| **Aerial Shore** | web | Palm crowns twisting in travelling gusts, a light swell washing up the sand, fish shadows in the turquoise shallows |
+| **Knight in the Meadow** | living | Wind through the wildflowers, drifting cloud, birds over the peak |
+| **Konbini Night** | web | Pixel-art vending machines: humming fluorescent light, glowing shelves, snow falling onto the pavement |
+| **Neon Tokyo** | web | Cloud bands drift across a golden-hour sunset; lit windows breathe, some switch off and back on, signage shimmers |
+| **Rainy Corner** | web | Layered rain over a blue night corner — the wet road ripples and splashes while the traffic light cycles |
+| **Red Cloud Shore** | web | Woodblock seascape: swell along the painted surf lines, foam running up the coral sand, salmon cumulus drifting |
+
+They are ordinary folders, so they double as reference material: open any
+`wallpaper.json` to see a fully tuned property set, or its `index.html` for the
+shader that consumes it.
+
 ## Writing a wallpaper
 
 Create a folder under `%APPDATA%\WallpaperForge\wallpapers\<name>\` containing a
@@ -243,5 +263,5 @@ tools/
   make-icon.js          generates assets/app.ico
   install-shortcuts.js  Desktop + Start-menu .lnk files
   living.js             create/tune living-image wallpapers
-wallpapers/     bundled example wallpapers
+wallpapers/     bundled wallpapers, shipped with the repo
 ```

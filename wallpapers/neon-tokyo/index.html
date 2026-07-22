@@ -1,0 +1,838 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>WallpaperForge - Neon Tokyo</title>
+<style>
+  html,
+  body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #0a0710;
+  }
+  canvas {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+  #error {
+    position: fixed;
+    inset: 0;
+    display: none;
+    place-content: center;
+    font: 500 15px/1.6 system-ui, sans-serif;
+    color: #8b93a7;
+    text-align: center;
+    padding: 8vh 10vw;
+  }
+</style>
+<canvas id="gl"></canvas>
+<canvas id="fx"></canvas>
+<div id="error"></div>
+
+<script>
+  /**
+   * Neon Tokyo: a painted golden-hour skyline that is animated without ever
+   * moving its geometry. The volcano, the ridges and every building stay exactly
+   * where the painter put them; only light and air change.
+   *
+   *   - cloud bands drift laterally across the sunset sky
+   *   - individual lit windows breathe, and a few switch off and back on
+   *   - saturated signage pulses at spatially varying rates, so the strip
+   *     shimmers instead of strobing
+   *   - a couple of aircraft lights cross the high sky, and warm air rises out
+   *     of the street canyon
+   *
+   * Everything that decides *where* an effect lands is measured from the plate
+   * itself. The important one is the skyline: a per-column scan on the CPU finds
+   * the first row of real geometry in each column, which is what lets the sky
+   * slide while a tower standing halfway up that sky does not. A flat "sky is
+   * the top 30%" rule cannot do that, and gating on brightness alone walks
+   * straight over the volcano's snow cap.
+   *
+   * Every number is exposed through `properties` so this can be retuned without
+   * touching the file.
+   */
+
+  const errorBox = document.getElementById('error');
+  const glCanvas = document.getElementById('gl');
+  const fxCanvas = document.getElementById('fx');
+
+  function fail(message) {
+    errorBox.textContent = message;
+    errorBox.style.display = 'grid';
+  }
+
+  // The skyline texture stores image-space Y scaled into a byte. Nothing in this
+  // painting has sky below the 46% line, so half the range is plenty of headroom
+  // and it doubles the precision of the stored value.
+  const SKY_RANGE = 0.5;
+  const SKY_TEX_W = 1024;
+  const SKY_SCAN_H = 320;
+
+  const VERT = `#version 300 es
+  in vec2 aPos;
+  out vec2 vUv;
+  void main() {
+    // Y is flipped so that uv.y = 0 is the TOP of both the screen and the
+    // texture. The texture half comes from uploading without UNPACK_FLIP_Y,
+    // which puts the image's first row at t = 0. Every "above the skyline" test
+    // downstream depends on this convention.
+    vUv = vec2(aPos.x * 0.5 + 0.5, 0.5 - aPos.y * 0.5);
+    gl_Position = vec4(aPos, 0.0, 1.0);
+  }`;
+
+  const FRAG = `#version 300 es
+  precision highp float;
+
+  in vec2 vUv;
+  out vec4 fragColor;
+
+  uniform sampler2D uImage;
+  uniform sampler2D uSkyline;   // R = drift line, G = city line, both / SKY_RANGE
+  uniform vec2  uResolution;
+  uniform float uImageAspect;
+  uniform float uTime;
+  uniform vec2  uFocus;
+
+  uniform float uSkyMargin;
+  uniform float uCloudDrift;
+  uniform float uCloudSpeed;
+  uniform float uCloudLayer;
+
+  uniform float uTierTop;
+  uniform float uCellsTop;
+  uniform float uCellsBottom;
+  uniform float uLitWarm;
+  uniform float uLitLum;
+
+  uniform float uSwitchShare;
+  uniform float uSwitchDepth;
+  uniform float uSwitchRate;
+  uniform float uBreatheShare;
+  uniform float uBreatheDepth;
+  uniform float uBreatheRate;
+
+  uniform float uNeonChroma;
+  uniform float uNeonTop;
+  uniform float uNeonDepth;
+  uniform float uNeonRate;
+
+  uniform float uBoardCells;
+  uniform float uBoardRate;
+  uniform float uBoardHue;
+  uniform float uBoardDip;
+  uniform float uBoardShare;
+  uniform vec4  uBoardKeep[4];   // xywh rects, in image UV, the boards skip
+  uniform int   uBoardKeepCount;
+
+  uniform float uHaze;
+  uniform vec2  uHazeAt;        // x = centre of the canyon, y = its half width
+  uniform float uShimmer;
+  uniform float uVignette;
+  uniform float uSaturate;
+  uniform float uBrightness;
+  uniform int   uDebug;
+
+  const float SKY_RANGE = 0.5;
+  const float TAU = 6.2831853;
+
+  /** Screen UV -> image UV for a cover (crop) fit. */
+  vec2 coverUv(vec2 uv) {
+    float screenAspect = uResolution.x / uResolution.y;
+    vec2 scale = screenAspect > uImageAspect
+      ? vec2(1.0, uImageAspect / screenAspect)
+      : vec2(screenAspect / uImageAspect, 1.0);
+    return (uv - 0.5) * scale + uFocus;
+  }
+
+  float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+
+  /** Gap between a pixel's strongest and weakest channel. */
+  float chroma(vec3 c) {
+    return max(c.r, max(c.g, c.b)) - min(c.r, min(c.g, c.b));
+  }
+
+  /** Sine-free integer-ish hash; one call feeds every random a cell needs. */
+  float hash21(vec2 p) {
+    p = fract(p * vec2(123.34, 456.21));
+    p += dot(p, p + 45.32);
+    return fract(p.x * p.y);
+  }
+
+  /**
+   * Rotate a colour about the grey axis (Rodrigues). Used instead of writing new
+   * colours onto the boards: rotating what the plate already painted keeps every
+   * sign inside this artwork's palette, where an arbitrary hue would not.
+   */
+  vec3 hueRotate(vec3 c, float angle) {
+    const vec3 k = vec3(0.57735026);
+    float ca = cos(angle);
+    return c * ca + cross(k, c) * sin(angle) + k * dot(k, c) * (1.0 - ca);
+  }
+
+  void main() {
+    vec2 uv0 = coverUv(vUv);
+
+    // Two skylines, both measured from the plate on the CPU. R is horizontally
+    // smoothed and lifted, and is where the cloud drift fades out - being
+    // conservative there costs a strip of motionless sky and buys the guarantee
+    // that no roofline ever shears. G is the raw per-column line, which is where
+    // the city begins; the window and sign effects need the true line, because
+    // the smoothed one marks the sky beside a tower as city and orange sky is
+    // just as warm and bright as a lit window.
+    vec2 lines = texture(uSkyline, vec2(clamp(uv0.x, 0.0, 1.0), 0.5)).rg * SKY_RANGE;
+    float sky  = 1.0 - smoothstep(lines.r - uSkyMargin, lines.r, uv0.y);
+    float city = smoothstep(lines.g, lines.g + 0.010, uv0.y);
+
+    // Clouds. Periods of 140s and 217s share no small common multiple, so the
+    // drift is quasi-periodic and never reads as a loop; and because it is a sum
+    // of sines rather than a velocity, the sky can never walk off the edge of
+    // the texture no matter how many days this runs. uCloudLayer detunes the
+    // drift by height so the bands separate slightly instead of sliding as one
+    // sheet - kept small, since the differential is a shear.
+    float t = uTime * uCloudSpeed;
+    float layer = 1.0 - uCloudLayer * (0.5 + 0.5 * sin(uv0.y * 26.0 + 1.3));
+    float dx = (sin(t * 0.0449) * 0.62 + sin(t * 0.0289 + 2.1) * 0.38) * uCloudDrift * layer;
+    float dy = sin(t * 0.0213 + uv0.x * 3.1) * uCloudDrift * 0.09;
+
+    vec2 uv = uv0 + vec2(dx, dy) * sky;
+    vec3 base = texture(uImage, clamp(uv, 0.0, 1.0)).rgb;
+    vec3 color = base;
+
+    float lum = luma(base);
+    float warm = base.r - base.b;
+
+    // Lit windows: warm, bright, below the skyline. Reading them out of the
+    // plate is what keeps this from needing a hand-listed coordinate table, and
+    // it means the same code works if the plate is ever repainted.
+    //
+    // uLitWarm is set well above zero on purpose. Windows here are tungsten,
+    // around 0.5 of red over blue; the cream lettering painted on the signs is
+    // just as bright but nearly neutral, and at a low threshold whole letters
+    // were switching off along with the windows.
+    float lit = city
+              * smoothstep(uLitWarm, uLitWarm + 0.18, warm)
+              * smoothstep(uLitLum, uLitLum + 0.22, lum);
+
+    // A grid of window-sized cells. Cells grow toward the bottom because the
+    // foreground buildings are nearer; the size steps per depth tier rather than
+    // varying continuously, which would bend the cell edges into diagonals.
+    float tier = floor(clamp((uv.y - uTierTop) / max(0.05, 1.0 - uTierTop), 0.0, 0.999) * 4.0);
+    float cellsX = mix(uCellsTop, uCellsBottom, tier / 3.0);
+    vec2 grid = vec2(uv.x * cellsX, uv.y * cellsX / uImageAspect);
+    vec2 cell = floor(grid);
+
+    // A radial falloff inside each cell, with no flat top. Nothing in this plate
+    // distinguishes a lit window from a lit sign face - measured, their
+    // brightness, warmth and local contrast ranges all overlap - so cells will
+    // land on signage no matter how the mask is tuned. What made that read as a
+    // defect was the shape: a hard-edged cell leaves a square, which is a grid
+    // artifact, while a soft blob just reads as a light changing.
+    float bump = 1.0 - smoothstep(0.15, 0.95, length(fract(grid) - 0.5) * 2.0);
+
+    float h  = hash21(cell + vec2(tier * 31.7, 11.3));
+    float r2 = fract(h * 137.31);
+    float r3 = fract(h * 39.73);
+    float r4 = fract(h * 71.17);
+
+    // Most cells only breathe: a few per cent over several seconds. On its own
+    // each one is below the threshold of notice; across a facade it is the
+    // difference between occupied rooms and a printed texture.
+    float bp = mix(5.0, 15.0, r2) / max(0.05, uBreatheRate);
+    float gain = 1.0 + uBreatheDepth * sin((uTime / bp + r3) * TAU)
+                     * step(1.0 - uBreatheShare, r4);
+
+    // A small share actually switch off and back on. period is tens of seconds
+    // and dwell a few, and only cells that landed on a lit window show anything
+    // at all, which is what puts the visible rate at a couple of changes per
+    // second across thousands of windows instead of a disco.
+    float period = mix(16.0, 64.0, r3) / max(0.05, uSwitchRate);
+    float dwell  = mix(1.2, 8.0, r2);
+    float e = fract(uTime / period + r4) * period;
+    float off = smoothstep(0.0, 0.20, e) - smoothstep(dwell, dwell + 0.35, e);
+    gain -= step(1.0 - uSwitchShare, h) * uSwitchDepth * clamp(off, 0.0, 1.0);
+
+    color *= mix(1.0, gain, lit * bump);
+
+    // Signage. Chroma is the measure that works here: a lit sign runs 0.25-0.63
+    // and dusk haze, concrete and asphalt all sit under 0.16. Luminance does
+    // not - a saturated red sign is darker than the grey wall behind it.
+    //
+    // Chroma alone still catches the volcano and the ridges, which are strongly
+    // coloured lavender at this hour, so signs are also gated on depth. Nothing
+    // is lost: above uNeonTop a sign is two pixels wide and pulsing it would
+    // read as noise rather than shimmer.
+    //
+    // Phase and rate vary by position rather than by cell, so neighbouring signs
+    // fall out of step with each other and the strip shimmers, and there are no
+    // cell edges to show on the wide flat boards.
+    //
+    // The rate is a blend between two FIXED frequencies, never sin(uTime *
+    // rate(uv)). That form looks correct for the first minute and then fails:
+    // the spatial frequency of the result is proportional to uTime, so the signs
+    // slowly grow a stripe pattern that gets finer for as long as the wallpaper
+    // is left running.
+    float neon = city
+               * smoothstep(uNeonTop - 0.05, uNeonTop + 0.05, uv0.y)
+               * smoothstep(uNeonChroma, uNeonChroma + 0.20, chroma(base));
+    float blend = 0.5 + 0.5 * sin(uv.x * 34.0 + uv.y * 7.0);
+    float slow = sin(uTime * 0.31 * uNeonRate + sin(uv.x * 21.0 - uv.y * 9.0) * 3.14159);
+    float fast = sin(uTime * 0.83 * uNeonRate + sin(uv.x * 13.0 + uv.y * 5.0 + 2.1) * 3.14159);
+    color *= 1.0 + uNeonDepth * mix(slow, fast, blend) * neon;
+
+    // Boards changing over. A real billboard does not fade between pictures, it
+    // drops and comes back as something else, so each cell dips and returns on a
+    // new hue. The dip is what sells it: without the blink a hue slide just looks
+    // like a colour wash drifting over the city.
+    //
+    // Cells are coarse - a board is far wider than a window - and the effect is
+    // multiplied by the neon mask, so it only ever lands on saturated signage.
+    // (No backticks in here: this shader is a JS template literal.) That is
+    // what keeps the cell grid invisible: an edge crossing dim concrete changes
+    // nothing there, and the boundary only shows if a single sign is wide enough
+    // to straddle two cells, which the soft falloff then hides.
+    vec2 bgrid = vec2(uv.x * uBoardCells, uv.y * uBoardCells / uImageAspect);
+    vec2 bcell = floor(bgrid);
+    float bh = hash21(bcell + vec2(7.31, 19.77));
+
+    float bPeriod = mix(13.0, 47.0, fract(bh * 61.7)) / max(0.05, uBoardRate);
+
+    // The start offset is mapped into 0.20-0.99 rather than 0.0-1.0 on purpose.
+    // With a plain fract(bh) start, every cell begins at a uniformly random
+    // point in its cycle, so about one in six lands inside the dip window and
+    // blinks the instant the wallpaper loads - which reads as the picture
+    // glitching on startup. Starting past the dip means the first change a cell
+    // makes is always a real one, several seconds in.
+    float bPhase = fract(uTime / bPeriod + 0.20 + bh * 0.79);
+
+    // Which picture is showing. Changing this integer is what changes the hue,
+    // so the board holds one colour for the whole dwell instead of sliding.
+    float stage = floor(uTime / bPeriod + 0.20 + bh * 0.79);
+    float pick = hash21(bcell + vec2(stage * 3.77, 91.3)) - 0.5;
+
+    // A brief blink at the top of each period: down fast, back a little slower.
+    float dip = smoothstep(0.0, 0.035, bPhase) - smoothstep(0.055, 0.16, bPhase);
+    dip = clamp(dip, 0.0, 1.0);
+
+    // Soft-edged so a cell boundary reads as a gradient rather than a seam.
+    float bBlob = 1.0 - smoothstep(0.35, 1.05, length(fract(bgrid) - 0.5) * 2.0);
+
+    // Glass office towers are lit and coloured enough to pass the chroma gate,
+    // but they are architecture, not advertising: dipping one blinks a whole
+    // facade and reads as the image glitching. Chroma cannot tell a tower from
+    // a signboard, so the towers are named explicitly and kept out.
+    float keep = 1.0;
+    for (int i = 0; i < 4; i++) {
+      if (i >= uBoardKeepCount) break;
+      vec4 r = uBoardKeep[i];
+      vec2 inside = smoothstep(vec2(0.0), vec2(0.012), uv - r.xy)
+                  * smoothstep(vec2(0.0), vec2(0.012), r.xy + r.zw - uv);
+      keep *= 1.0 - inside.x * inside.y;
+    }
+
+    float board = neon * bBlob * keep * step(1.0 - uBoardShare, fract(bh * 13.9));
+
+    color = mix(color, hueRotate(color, pick * uBoardHue), board * (1.0 - dip * 0.5));
+    color *= 1.0 - uBoardDip * dip * board;
+
+    // Warm air off the street canyon. Screen space on purpose: this is haze in
+    // front of the painting, not part of it.
+    float hx = (vUv.x - uHazeAt.x) / max(0.01, uHazeAt.y);
+    float plume = exp(-hx * hx) * smoothstep(0.60, 1.0, vUv.y);
+    plume *= 0.70 + 0.30 * (0.5 * sin(vUv.x * 17.0 - uTime * 0.19)
+                          + 0.5 * sin(vUv.y * 11.0 + uTime * 0.31));
+    color += uHaze * plume * vec3(1.0, 0.66, 0.36);
+
+    color *= 1.0 + uShimmer * sin(uTime * 0.11);
+    color *= uBrightness;
+    color = mix(vec3(luma(color)), color, uSaturate);
+
+    float vig = 1.0 - uVignette * pow(length((vUv - 0.5) * vec2(1.05, 1.0)) * 1.32, 2.4);
+    color *= clamp(vig, 0.0, 1.0);
+
+    // Mask inspection. A shader that mis-detects renders a plausible-looking
+    // still frame, so there has to be a way to see what it actually matched.
+    if (uDebug == 1) color = mix(color, vec3(1.0, 0.10, 0.10), sky * 0.65);
+    if (uDebug == 2) color = mix(color, vec3(0.10, 1.0, 0.25), city * 0.55);
+    if (uDebug == 3) color = mix(color, vec3(1.0, 0.90, 0.10), lit * 0.95);
+    if (uDebug == 4) color = mix(color, vec3(1.0, 0.10, 1.0), neon * 0.95);
+
+    fragColor = vec4(color, 1.0);
+  }`;
+
+  function compile(gl, type, source) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      throw new Error(gl.getShaderInfoLog(shader) || 'shader compile failed');
+    }
+    return shader;
+  }
+
+  function buildProgram(gl) {
+    const program = gl.createProgram();
+    gl.attachShader(program, compile(gl, gl.VERTEX_SHADER, VERT));
+    gl.attachShader(program, compile(gl, gl.FRAGMENT_SHADER, FRAG));
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      throw new Error(gl.getProgramInfoLog(program) || 'program link failed');
+    }
+    return program;
+  }
+
+  function loadImage(src) {
+    return new Promise((resolve, reject) => {
+      const image = new Image();
+      image.crossOrigin = 'anonymous';
+      image.onload = () => resolve(image);
+      image.onerror = () => reject(new Error(`Could not load ${src}`));
+      image.src = src;
+    });
+  }
+
+  const clamp01 = (v) => Math.min(1, Math.max(0, v));
+
+  /** Sliding minimum over +/- radius samples, edges clamped. */
+  function minFilter(src, radius) {
+    const n = src.length;
+    const out = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      let m = src[i];
+      for (let k = -radius; k <= radius; k++) {
+        const v = src[Math.min(n - 1, Math.max(0, i + k))];
+        if (v < m) m = v;
+      }
+      out[i] = m;
+    }
+    return out;
+  }
+
+  function boxBlur(src, radius) {
+    const n = src.length;
+    const out = new Float32Array(n);
+    const width = radius * 2 + 1;
+    for (let i = 0; i < n; i++) {
+      let sum = 0;
+      for (let k = -radius; k <= radius; k++) sum += src[Math.min(n - 1, Math.max(0, i + k))];
+      out[i] = sum / width;
+    }
+    return out;
+  }
+
+  /** Sliding median over +/- radius samples, edges clamped. */
+  function medianFilter(src, radius) {
+    const n = src.length;
+    const out = new Float32Array(n);
+    const window = [];
+    for (let i = 0; i < n; i++) {
+      window.length = 0;
+      for (let k = -radius; k <= radius; k++) window.push(src[Math.min(n - 1, Math.max(0, i + k))]);
+      window.sort((a, b) => a - b);
+      out[i] = window[radius];
+    }
+    return out;
+  }
+
+  /** Sliding maximum over +/- radius samples, edges clamped. */
+  function maxFilter(src, radius) {
+    const n = src.length;
+    const out = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      let m = src[i];
+      for (let k = -radius; k <= radius; k++) {
+        const v = src[Math.min(n - 1, Math.max(0, i + k))];
+        if (v > m) m = v;
+      }
+      out[i] = m;
+    }
+    return out;
+  }
+
+  /**
+   * Find, for every column of the plate, the first row that is real geometry
+   * rather than sky, and pack two versions of that line into an RGBA row.
+   *
+   * Absolute brightness cannot do this. Measured off this plate, the dark cloud
+   * bands sit at luminance 0.44-0.48 and so does the volcano; the distant ridges
+   * are *brighter* than both at 0.51-0.59. Any fixed threshold either eats the
+   * clouds or misses the mountain.
+   *
+   * What does separate them is that a cloud is only ever a little darker than
+   * the sky immediately above it, while geometry is a cliff. Measured here, the
+   * worst cloud drops to 0.76 of the sky above it and the volcano to 0.68, so
+   * the test is relative and the threshold sits between the two. The reference
+   * deliberately stops updating once a row fails, otherwise it decays to the
+   * brightness of whatever building we are now inside and calls it sky again.
+   *
+   * The reference is the second brightest row of the window rather than the
+   * brightest. A single sunlit cloud rim is enough to lift a max-based
+   * reference over that 0.76/0.68 gap, and because the reference then freezes,
+   * one bright row was taking the entire cloud below it with it.
+   *
+   * One failing row is still not enough to stop the scan - the underside of a
+   * cloud is exactly that. The line is the start of the first *run* of failing
+   * rows long enough to be geometry: cloud bands here are 40-60px thick, and
+   * anything below a real roofline keeps going to the bottom of the frame.
+   */
+  function extractSkyline(image, opt) {
+    const w = SKY_TEX_W;
+    const h = SKY_SCAN_H;
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(image, 0, 0, w, h);
+    const px = ctx.getImageData(0, 0, w, h).data;
+
+    const limit = Math.max(4, Math.min(h - 1, Math.round(h * opt.scanLimit)));
+    const runLength = Math.max(1, Math.round(opt.persist * h));
+    const refRows = Math.max(2, Math.round(opt.refWindow * h));
+    const raw = new Float32Array(w);
+    const recent = new Float32Array(refRows);
+
+    const lumAt = (x, y) => {
+      const i = (y * w + x) * 4;
+      return (px[i] * 0.299 + px[i + 1] * 0.587 + px[i + 2] * 0.114) / 255;
+    };
+
+    for (let x = 0; x < w; x++) {
+      let filled = 0;
+      let cursor = 0;
+      let streak = 0;
+      let start = limit;
+      let line = limit;
+
+      for (let y = 0; y < limit; y++) {
+        const value = lumAt(x, y);
+        let best = -1;
+        let ref = -1;
+        for (let i = 0; i < filled; i++) {
+          const sample = recent[i];
+          if (sample > best) {
+            ref = best;
+            best = sample;
+          } else if (sample > ref) {
+            ref = sample;
+          }
+        }
+        if (ref < 0) ref = best;
+
+        if (filled === 0 || value > ref * opt.skyRatio) {
+          recent[cursor] = value;
+          cursor = (cursor + 1) % refRows;
+          if (filled < refRows) filled++;
+          streak = 0;
+          continue;
+        }
+        if (streak === 0) start = y;
+        if (++streak >= runLength) {
+          line = start;
+          break;
+        }
+      }
+      raw[x] = line / h;
+    }
+
+    // A median first, because the scan can still lose a column here and there
+    // and one stray column, once eroded and blurred, opens a wedge of dead sky
+    // a couple of hundred pixels wide. Nothing above this skyline is narrower
+    // than the median window; the two towers are 20 and 68 columns across.
+    const line = medianFilter(raw, Math.max(1, Math.round(opt.medianRadius * w)));
+
+    // The drift line has to be conservative in x as well as y. Eroding it first
+    // pulls the whole neighbourhood of a tall tower up to that tower's roof;
+    // blurring then turns the step into a ramp, so the drift fades in over ~100
+    // image pixels instead of dying against a hard edge and shearing the cloud
+    // beside it. Taking the min of the two puts back the guarantee the blur
+    // would otherwise lose: the line can never sit below real geometry.
+    const eroded = minFilter(line, Math.max(1, Math.round(opt.minRadius * w)));
+    const blurR = Math.max(1, Math.round(opt.blurRadius * w));
+    const smoothed = boxBlur(boxBlur(eroded, blurR), blurR);
+
+    // The city line fails safe in the opposite direction - too high means the
+    // sunset sky, which is every bit as warm and bright as a lit window, starts
+    // flickering - so it gets a small dilation and a hard ceiling above which no
+    // column may ever claim to be city.
+    const city = maxFilter(line, Math.max(1, Math.round(opt.cityMaxRadius * w)));
+
+    const data = new Uint8Array(w * 4);
+    for (let i = 0; i < w; i++) {
+      const drift = Math.max(0, Math.min(eroded[i], smoothed[i]) - opt.lift);
+      data[i * 4] = Math.round(clamp01(drift / SKY_RANGE) * 255);
+      data[i * 4 + 1] = Math.round(
+        clamp01(Math.max(opt.cityCeiling, city[i] + opt.cityDrop) / SKY_RANGE) * 255
+      );
+      data[i * 4 + 2] = 0;
+      data[i * 4 + 3] = 255;
+    }
+    return data;
+  }
+
+  /**
+   * Aircraft lights on a 2D overlay. Two pixels of steady white with a red
+   * beacon is all an airliner is from this far away, and a sprite is far easier
+   * to keep crisp than the equivalent signed-distance work in the shader.
+   *
+   * They are confined to the top of the sky rather than depth-sorted against the
+   * skyline, because everything above 0.13 in this frame is empty air.
+   */
+  function createOverlay(canvas, props, num) {
+    const ctx = canvas.getContext('2d');
+    const count = Math.max(0, Math.round(num(props.aircraft, 2)));
+    const speed = num(props.aircraftSpeed, 1);
+    const band = Array.isArray(props.aircraftBand) ? props.aircraftBand : [0.05, 0.12];
+    const top = num(band[0], 0.05);
+    const bottom = num(band[1], 0.12);
+
+    let width = 1;
+    let height = 1;
+
+    const spawn = (offscreen) => {
+      const dir = Math.random() < 0.5 ? 1 : -1;
+      return {
+        dir,
+        x: offscreen ? (dir > 0 ? -0.06 : 1.06) : Math.random(),
+        y: top + Math.random() * Math.max(0.005, bottom - top),
+        speed: (0.0050 + Math.random() * 0.0042) * speed,
+        blink: Math.random(),
+        rate: 0.6 + Math.random() * 0.35,
+        // Empty sky between crossings; without it two planes would shuttle back
+        // and forth on a fixed cadence, which is exactly the loop to avoid.
+        wait: offscreen ? 25 + Math.random() * 110 : 0
+      };
+    };
+
+    const craft = [];
+    for (let i = 0; i < count; i++) craft.push(spawn(i > 0));
+
+    function resize(w, h) {
+      width = w;
+      height = h;
+    }
+
+    function update(dt) {
+      for (const a of craft) {
+        if (a.wait > 0) {
+          a.wait -= dt;
+          continue;
+        }
+        a.x += a.dir * a.speed * dt;
+        a.blink += a.rate * dt;
+        if (a.x < -0.08 || a.x > 1.08) Object.assign(a, spawn(true));
+      }
+    }
+
+    function draw() {
+      ctx.clearRect(0, 0, width, height);
+      const r = Math.max(1, height * 0.0016);
+      for (const a of craft) {
+        if (a.wait > 0) continue;
+        const x = a.x * width;
+        const y = a.y * height;
+
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(255, 246, 226, 0.72)';
+        ctx.fill();
+
+        // Short, sharp beacon flash rather than a sine, which is what a strobe
+        // actually looks like from the ground.
+        const beacon = Math.max(0, Math.sin(a.blink * Math.PI * 2) - 0.88) / 0.12;
+        if (beacon > 0) {
+          ctx.beginPath();
+          ctx.arc(x - a.dir * r * 2.6, y, r * 0.85, 0, Math.PI * 2);
+          ctx.fillStyle = `rgba(255, 104, 86, ${(0.85 * beacon).toFixed(3)})`;
+          ctx.fill();
+        }
+      }
+    }
+
+    return { resize, update, draw, active: count > 0 };
+  }
+
+  async function boot() {
+    const config = await window.wallpaperForge.getConfig();
+    if (!config || !config.wallpaper) return fail('No wallpaper assigned.');
+    const properties = config.wallpaper.properties || {};
+
+    const num = (value, fallback) => (Number.isFinite(Number(value)) ? Number(value) : fallback);
+
+    const gl = glCanvas.getContext('webgl2', {
+      antialias: false,
+      alpha: false,
+      powerPreference: 'low-power'
+    });
+    if (!gl) return fail('WebGL2 is not available on this machine.');
+
+    const image = await loadImage(String(properties.plate || 'media/plate.png'));
+
+    const skyline = extractSkyline(image, {
+      skyRatio: num(properties.skyRatio, 0.7),
+      refWindow: num(properties.skyRefWindow, 0.05),
+      persist: num(properties.skyPersist, 0.045),
+      scanLimit: num(properties.skyScanLimit, 0.45),
+      medianRadius: num(properties.skyMedianRadius, 0.005),
+      minRadius: num(properties.skyMinRadius, 0.022),
+      blurRadius: num(properties.skyBlurRadius, 0.038),
+      lift: num(properties.skyLift, 0.024),
+      cityDrop: num(properties.cityDrop, 0.006),
+      cityMaxRadius: num(properties.cityMaxRadius, 0.003),
+      cityCeiling: num(properties.cityCeiling, 0.15)
+    });
+
+    const program = buildProgram(gl);
+    gl.useProgram(program);
+
+    const buffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+    const aPos = gl.getAttribLocation(program, 'aPos');
+    gl.enableVertexAttribArray(aPos);
+    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+    gl.activeTexture(gl.TEXTURE0);
+    const plate = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, plate);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false); // uv.y = 0 is the top of the image
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+    gl.activeTexture(gl.TEXTURE1);
+    const skyTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, skyTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, SKY_TEX_W, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, skyline);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+    const u = (name) => gl.getUniformLocation(program, name);
+    const uResolution = u('uResolution');
+    const uTime = u('uTime');
+
+    const focus = Array.isArray(properties.focus) ? properties.focus : [0.5, 0.5];
+    const hazeAt = Array.isArray(properties.hazeAt) ? properties.hazeAt : [0.52, 0.17];
+
+    gl.uniform1i(u('uImage'), 0);
+    gl.uniform1i(u('uSkyline'), 1);
+    gl.uniform1f(u('uImageAspect'), image.width / image.height);
+    gl.uniform2f(u('uFocus'), num(focus[0], 0.5), num(focus[1], 0.5));
+
+    gl.uniform1f(u('uSkyMargin'), num(properties.skyMargin, 0.02));
+    gl.uniform1f(u('uCloudDrift'), num(properties.cloudDrift, 0.014));
+    gl.uniform1f(u('uCloudSpeed'), num(properties.cloudSpeed, 1));
+    gl.uniform1f(u('uCloudLayer'), num(properties.cloudLayer, 0.22));
+
+    gl.uniform1f(u('uTierTop'), num(properties.tierTop, 0.3));
+    gl.uniform1f(u('uCellsTop'), num(properties.cellsTop, 300));
+    gl.uniform1f(u('uCellsBottom'), num(properties.cellsBottom, 96));
+    gl.uniform1f(u('uLitWarm'), num(properties.litWarm, 0.18));
+    gl.uniform1f(u('uLitLum'), num(properties.litLum, 0.44));
+
+    gl.uniform1f(u('uSwitchShare'), num(properties.switchShare, 0.035));
+    gl.uniform1f(u('uSwitchDepth'), num(properties.switchDepth, 0.6));
+    gl.uniform1f(u('uSwitchRate'), num(properties.switchRate, 1));
+    gl.uniform1f(u('uBreatheShare'), num(properties.breatheShare, 0.3));
+    gl.uniform1f(u('uBreatheDepth'), num(properties.breatheDepth, 0.055));
+    gl.uniform1f(u('uBreatheRate'), num(properties.breatheRate, 1));
+
+    gl.uniform1f(u('uNeonChroma'), num(properties.neonChroma, 0.2));
+    gl.uniform1f(u('uNeonTop'), num(properties.neonTop, 0.44));
+    gl.uniform1f(u('uNeonDepth'), num(properties.neonDepth, 0.05));
+    gl.uniform1f(u('uNeonRate'), num(properties.neonRate, 1));
+
+    gl.uniform1f(u('uBoardCells'), num(properties.boardCells, 22));
+    gl.uniform1f(u('uBoardRate'), num(properties.boardRate, 1));
+    gl.uniform1f(u('uBoardHue'), num(properties.boardHue, 1.15));
+    gl.uniform1f(u('uBoardDip'), num(properties.boardDip, 0.5));
+    gl.uniform1f(u('uBoardShare'), num(properties.boardShare, 0.55));
+
+    // Rects the board effect must leave alone, [x, y, w, h] in image UV.
+    const keepOut = (Array.isArray(properties.boardKeep) ? properties.boardKeep : []).slice(0, 4);
+    const keepData = new Float32Array(16);
+    keepOut.forEach((rect, i) => {
+      const r = Array.isArray(rect) ? rect : [];
+      keepData[i * 4 + 0] = num(r[0], 0);
+      keepData[i * 4 + 1] = num(r[1], 0);
+      keepData[i * 4 + 2] = Math.max(0, num(r[2], 0));
+      keepData[i * 4 + 3] = Math.max(0, num(r[3], 0));
+    });
+    gl.uniform4fv(u('uBoardKeep'), keepData);
+    gl.uniform1i(u('uBoardKeepCount'), keepOut.length);
+
+    gl.uniform1f(u('uHaze'), num(properties.haze, 0.03));
+    gl.uniform2f(u('uHazeAt'), num(hazeAt[0], 0.52), num(hazeAt[1], 0.17));
+    gl.uniform1f(u('uShimmer'), num(properties.shimmer, 0));
+    gl.uniform1f(u('uVignette'), num(properties.vignette, 0));
+    gl.uniform1f(u('uSaturate'), num(properties.saturate, 1));
+    gl.uniform1f(u('uBrightness'), num(properties.brightness, 1));
+    gl.uniform1i(u('uDebug'), Math.round(num(properties.debug, 0)));
+
+    const overlay = createOverlay(fxCanvas, properties, num);
+
+    function resize() {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const w = Math.max(1, Math.round(window.innerWidth * dpr));
+      const h = Math.max(1, Math.round(window.innerHeight * dpr));
+      for (const canvas of [glCanvas, fxCanvas]) {
+        canvas.width = w;
+        canvas.height = h;
+      }
+      gl.viewport(0, 0, w, h);
+      gl.uniform2f(uResolution, w, h);
+      overlay.resize(w, h);
+    }
+    resize();
+    window.addEventListener('resize', resize);
+
+    let raf = null;
+    let last = performance.now();
+    // Start the clock partway in so the wallpaper does not open on the moment
+    // every cell's cycle is aligned at zero. Raising this is also how you check
+    // that nothing degrades over a long run: this thing is left on for days.
+    let clock = num(properties.clockStart, 137.4);
+
+    function frame(now) {
+      raf = requestAnimationFrame(frame);
+      const dt = Math.min(0.05, (now - last) / 1000);
+      last = now;
+      clock += dt;
+
+      gl.uniform1f(uTime, clock);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+      if (overlay.active) {
+        overlay.update(dt);
+        overlay.draw();
+      }
+    }
+
+    function start() {
+      if (raf !== null) return;
+      last = performance.now();
+      raf = requestAnimationFrame(frame);
+    }
+    function stop() {
+      if (raf === null) return;
+      cancelAnimationFrame(raf);
+      raf = null;
+    }
+
+    // This runs 24/7 behind the desktop, so a rAF left alive while paused burns
+    // CPU forever.
+    window.wallpaperForge.onPause((paused) => {
+      if (paused) stop();
+      else start();
+    });
+
+    if (!window.wallpaperForge.isPaused()) start();
+  }
+
+  boot().catch((err) => fail(String(err && err.message ? err.message : err)));
+</script>

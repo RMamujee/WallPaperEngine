@@ -1,0 +1,37 @@
+{
+  "name": "Knight in the Meadow",
+  "type": "living",
+  "description": "Alpine meadow at full width: wind through the wildflowers, drifting cloud, birds over the peak",
+  "source": "media/plate.png",
+  "preview": "media/plate.png",
+  "audio": false,
+  "cursor": true,
+  "properties": {
+    "fit": "cover",
+    "focus": [
+      0.5,
+      0.5
+    ],
+    "horizon": 0.58,
+    "wind": 0.009,
+    "windSpeed": 1,
+    "vegFloor": 0.04,
+    "earthGuard": 0.95,
+    "calm": [
+      [0.472, 0.688, 0.058, 0.118]
+    ],
+    "skyDrift": 0.004,
+    "shimmer": 0.014,
+    "parallax": 0.014,
+    "vignette": 0.2,
+    "saturate": 1.05,
+    "brightness": 1,
+    "birds": 8,
+    "birdBand": [
+      0.05,
+      0.26
+    ],
+    "birdSpeed": 1,
+    "motes": 55
+  }
+}

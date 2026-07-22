@@ -1,0 +1,1076 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>WallpaperForge - rainy corner</title>
+<style>
+  html,
+  body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #04121f;
+  }
+  canvas {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+  #error {
+    position: fixed;
+    inset: 0;
+    display: none;
+    place-content: center;
+    font: 500 15px/1.6 system-ui, sans-serif;
+    color: #8b93a7;
+    text-align: center;
+    padding: 8vh 10vw;
+  }
+</style>
+<canvas id="gl"></canvas>
+<canvas id="fx"></canvas>
+<div id="error"></div>
+
+<script>
+  /**
+   * "Rainy corner": a still flat-illustration street corner, animated.
+   *
+   * The split is the same one living.html uses, for the same reason - a shader
+   * is the only cheap way to move pixels that are already in the plate, and a
+   * 2D canvas is far easier to keep crisp for anything drawn on top:
+   *
+   *   - the shader owns the wet road. It displaces UVs below `roadY` with a
+   *     broad wobble plus two fields of expanding rings, so the kiosk's baked
+   *     reflection ripples instead of sitting there like a decal
+   *   - the overlay owns everything that is not in the plate: rain, splashes,
+   *     the traffic light lamps, the taxi and its passenger
+   *
+   * All geometry is written in *plate pixels* against the 2560x1600 artwork
+   * (see ART_W/ART_H), because every position here was measured off the plate.
+   * A single `unit` converts those to screen pixels; the cover fit guarantees
+   * the same scale on both axes, so shapes never distort.
+   */
+
+  const errorBox = document.getElementById('error');
+  const glCanvas = document.getElementById('gl');
+  const fxCanvas = document.getElementById('fx');
+
+  function fail(message) {
+    errorBox.textContent = message;
+    errorBox.style.display = 'grid';
+  }
+
+  const VERT = `#version 300 es
+  in vec2 aPos;
+  out vec2 vUv;
+  void main() {
+    // Y is flipped so uv.y = 0 is the TOP of both screen and texture. The
+    // texture half of that comes from uploading with UNPACK_FLIP_Y off, which
+    // puts the image's first row at t = 0. Every "below the road" test
+    // downstream depends on this convention.
+    vUv = vec2(aPos.x * 0.5 + 0.5, 0.5 - aPos.y * 0.5);
+    gl_Position = vec4(aPos, 0.0, 1.0);
+  }`;
+
+  const FRAG = `#version 300 es
+  precision highp float;
+
+  in vec2 vUv;
+  out vec4 fragColor;
+
+  uniform sampler2D uImage;
+  uniform vec2  uResolution;
+  uniform float uImageAspect;
+  uniform float uTime;
+  uniform float uRoadY;        // image-space Y where the wet road starts
+  uniform float uWobble;       // broad surface wobble, in image UV units
+  uniform float uRipple;       // expanding-ring displacement
+  uniform float uRippleRate;
+  uniform float uShimmer;      // brightness breathing on reflected light
+
+  /** Screen UV -> image UV for a cover (crop) fit. The plate is 16:10 like the
+      target display, so in practice this is close to the identity. */
+  vec2 coverUv(vec2 uv) {
+    float screenAspect = uResolution.x / uResolution.y;
+    vec2 scale = screenAspect > uImageAspect
+      ? vec2(1.0, uImageAspect / screenAspect)
+      : vec2(screenAspect / uImageAspect, 1.0);
+    return (uv - 0.5) * scale + 0.5;
+  }
+
+  float hash21(vec2 p) {
+    vec3 q = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
+    q += dot(q, q.yzx + 33.33);
+    return fract((q.x + q.y) * q.z);
+  }
+
+  /**
+   * One field of expanding rings. The road is cut into cells and each cell owns
+   * a single ripple whose phase comes from a hash of the cell id, so nothing
+   * ever pulses in step. The ring is capped well short of half a cell, which is
+   * what stops the cell border from clipping it into a visible grid.
+   */
+  vec2 ripples(vec2 iuv, float scale, float rate, float seed) {
+    vec2 g = vec2(iuv.x, (iuv.y - uRoadY) * 2.4) * scale + seed;
+    vec2 id = floor(g);
+    vec2 jitter = vec2(hash21(id + 1.7), hash21(id + 9.1)) * 0.22 - 0.11;
+    vec2 d = fract(g) - 0.5 - jitter;
+
+    // Squashed distance: a circular ripple seen at this grazing angle is an
+    // ellipse, and a round one immediately reads as a bubble instead.
+    float dist = length(d * vec2(1.0, 1.9)) + 0.0004;
+    float phase = fract(uTime * rate * uRippleRate + hash21(id));
+    float radius = phase * 0.36;
+    float band = sin((dist - radius) * 78.0) * exp(-abs(dist - radius) * 30.0);
+    float life = (1.0 - phase) * smoothstep(0.0, 0.09, phase);
+    return (d / dist) * band * life * vec2(1.0, 0.55);
+  }
+
+  void main() {
+    vec2 base = coverUv(vUv);
+    vec3 dry = texture(uImage, clamp(base, 0.0, 1.0)).rgb;
+    vec3 color = dry;
+
+    // The ramp matters: switching displacement on at a hard edge shows up as a
+    // seam running the width of the frame.
+    float road = smoothstep(uRoadY, uRoadY + 0.028, base.y);
+
+    if (road > 0.002) {
+      // Water nearer the camera makes bigger, slower shapes.
+      float near = 0.35 + 1.65 * clamp((base.y - uRoadY) / max(0.0001, 1.0 - uRoadY), 0.0, 1.0);
+
+      // Warm pixels are the kiosk and the lamp reflections. They get most of
+      // the movement, because a mirror image is the only part of a flat dark
+      // road where movement is actually visible. Do not name this "flat" - that
+      // is a reserved interpolation qualifier in GLSL ES 3. Avoid backticks in
+      // here too: this shader is a JS template literal and one would end it.
+      float warm = smoothstep(0.04, 0.30, dry.r - dry.b * 0.55);
+
+      float wob = sin(base.x * 118.0 + uTime * 0.83)
+                + 0.62 * sin(base.x * 47.0 - uTime * 0.57 + 2.3)
+                + 0.40 * sin(base.x * 211.0 + uTime * 1.31 + 5.1);
+
+      vec2 offset = vec2(0.0, wob * uWobble * near * (0.35 + warm));
+      offset += ripples(base, 34.0, 0.55, 0.0) * uRipple * near;
+      offset += ripples(base, 19.0, 0.33, 4.7) * uRipple * near * 1.5;
+
+      color = texture(uImage, clamp(base + offset * road, 0.0, 1.0)).rgb;
+
+      // A reflection on broken water loses and regains brightness as the
+      // surface tilts away from the light.
+      float shimmer = sin(base.x * 96.0 - uTime * 1.7) * sin(base.y * 90.0 + uTime * 0.9);
+      color *= 1.0 + uShimmer * warm * road * shimmer;
+    }
+
+    fragColor = vec4(color, 1.0);
+  }`;
+
+  function compile(gl, type, source) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      throw new Error(gl.getShaderInfoLog(shader) || 'shader compile failed');
+    }
+    return shader;
+  }
+
+  function buildProgram(gl) {
+    const program = gl.createProgram();
+    gl.attachShader(program, compile(gl, gl.VERTEX_SHADER, VERT));
+    gl.attachShader(program, compile(gl, gl.FRAGMENT_SHADER, FRAG));
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      throw new Error(gl.getProgramInfoLog(program) || 'program link failed');
+    }
+    return program;
+  }
+
+  function loadImage(src) {
+    return new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = () => reject(new Error(`Could not load ${src}`));
+      image.src = src;
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Plate coordinates. Everything below was measured off media/plate.png.
+  // ---------------------------------------------------------------------------
+
+  const ART_W = 2560;
+  const ART_H = 1600;
+  const TAU = Math.PI * 2;
+
+  // The traffic light. The plate has its RED lamp lit and baked in, so before a
+  // different colour can be shown that lamp has to be hidden - see paintLight.
+  const LIGHT = {
+    x: 2073,
+    lensY: { red: 1095, amber: 1113, green: 1131 },
+    radius: 8.6,
+    // A window around one lamp, wide enough to include the side visor and to
+    // land on plain background at both edges.
+    patch: { x: 2058, w: 42, h: 18 },
+    color: { red: [246, 82, 30], amber: [250, 168, 34], green: [46, 232, 138] }
+  };
+
+  // The cab, traced off the taxi that was removed from the plate: 208 art pixels
+  // bumper to bumper, 66 from tyre contact to roof. Y is measured up from the
+  // tyre contact patch, X out from the middle of the car.
+  const CAB = {
+    half: 104,
+    roof: -66,
+    deck: -47, // bonnet and boot lid, both above the waist
+    belt: -41, // the light strip along the flank
+    sill: -11,
+    wheelY: -15,
+    wheelR: 14,
+    archR: 15.5,
+    frontAxle: -58,
+    rearAxle: 57,
+    screenBase: -36, // where the windscreen meets the bonnet
+    roofFront: -18,
+    roofBack: 42,
+    pillarBase: 57
+  };
+
+  const KIOSK_DOOR_X = 1706; // where a passenger appears from / disappears into
+  const KIOSK_DOOR_Y = 1420;
+
+  const num = (value, fallback) => (Number.isFinite(Number(value)) ? Number(value) : fallback);
+  const rgba = (c, a) => `rgba(${c[0]}, ${c[1]}, ${c[2]}, ${a})`;
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+  const smooth = (a, b, t) => {
+    const x = clamp01((t - a) / (b - a));
+    return x * x * (3 - 2 * x);
+  };
+
+  /** A soft round light, pre-rendered once so no gradient is built per frame. */
+  function makeGlow(color) {
+    const size = 128;
+    const canvas = document.createElement('canvas');
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext('2d');
+    const g = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+    g.addColorStop(0, rgba(color, 0.5));
+    g.addColorStop(0.1, rgba(color, 0.3));
+    g.addColorStop(0.3, rgba(color, 0.1));
+    g.addColorStop(0.62, rgba(color, 0.022));
+    g.addColorStop(1, rgba(color, 0));
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, size, size);
+    return canvas;
+  }
+
+  /**
+   * A soft strip: opaque down the middle, transparent at every edge. Stacked
+   * with overlap it makes a continuous smear with no visible joins, which is
+   * what a reflection running away across wet tarmac has to look like.
+   */
+  const sliverCache = new Map();
+  function makeSliver(color) {
+    const key = color.join();
+    const cached = sliverCache.get(key);
+    if (cached) return cached;
+
+    const w = 64;
+    const h = 32;
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+
+    const across = ctx.createLinearGradient(0, 0, w, 0);
+    across.addColorStop(0, rgba(color, 0));
+    across.addColorStop(0.5, rgba(color, 1));
+    across.addColorStop(1, rgba(color, 0));
+    ctx.fillStyle = across;
+    ctx.fillRect(0, 0, w, h);
+
+    ctx.globalCompositeOperation = 'destination-in';
+    const along = ctx.createLinearGradient(0, 0, 0, h);
+    along.addColorStop(0, 'rgba(0,0,0,0)');
+    along.addColorStop(0.5, 'rgba(0,0,0,1)');
+    along.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = along;
+    ctx.fillRect(0, 0, w, h);
+
+    sliverCache.set(key, canvas);
+    return canvas;
+  }
+
+  /**
+   * A thumbnail of the plate, kept so a splash can ask what it landed in.
+   * Ripples are only visible where there is light to reflect: on the dark half
+   * of the road they should barely register, and inside the kiosk's reflection
+   * they should pick up its colour. Reading that off the artwork gets both for
+   * free and keeps working if the plate is ever repainted.
+   */
+  function buildPlateMap(plate) {
+    const w = 320;
+    const h = 200;
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(plate, 0, 0, w, h);
+    return { w, h, data: ctx.getImageData(0, 0, w, h).data };
+  }
+
+  function samplePlate(map, artX, artY) {
+    const ix = Math.max(0, Math.min(map.w - 1, Math.round((artX / ART_W) * map.w)));
+    const iy = Math.max(0, Math.min(map.h - 1, Math.round((artY / ART_H) * map.h)));
+    const i = (iy * map.w + ix) * 4;
+    return [map.data[i], map.data[i + 1], map.data[i + 2]];
+  }
+
+  // ---------------------------------------------------------------------------
+  // The overlay: rain, splashes, traffic light, cab, passenger.
+  // ---------------------------------------------------------------------------
+
+  function createOverlay(canvas, plate, props) {
+    const ctx = canvas.getContext('2d');
+
+    const rainCount = Math.max(0, Math.round(num(props.rainCount, 520)));
+    const rainSlant = num(props.rainSlant, 0.26);
+    const rainSpeed = num(props.rainSpeed, 1);
+    const rainOpacity = num(props.rainOpacity, 1);
+    const splashChance = clamp01(num(props.splashChance, 0.45));
+    const cabEnabled = props.cabEnabled !== false;
+    const cabStopX = num(props.cabStopX, 0.7942) * ART_W;
+    const cabGroundY = num(props.cabGroundY, 0.89) * ART_H;
+    const cabScale = num(props.cabScale, 1);
+    const cabGap = Math.max(4, num(props.cabGap, 52));
+    const cabGapJitter = Math.max(0, num(props.cabGapJitter, 18));
+    const PHASES = [
+      ['red', Math.max(1, num(props.redSeconds, 12))],
+      ['green', Math.max(1, num(props.greenSeconds, 10))],
+      ['amber', Math.max(0.5, num(props.amberSeconds, 3))]
+    ];
+
+    // Depth layers. `ground` is the art-space band each layer lands in, which is
+    // what spreads the splashes across the road instead of lining them all up
+    // along a single row. The nearest layer has no ground - it falls past the
+    // bottom of the frame, the way rain between you and the scene would.
+    const RAIN = [
+      { frac: 0.4, len: 30, speed: 900, alpha: 0.08, width: 1.2, ground: [1416, 1450] },
+      { frac: 0.28, len: 52, speed: 1300, alpha: 0.11, width: 1.6, ground: [1438, 1512] },
+      { frac: 0.2, len: 84, speed: 1800, alpha: 0.15, width: 2.1, ground: [1486, 1600] },
+      { frac: 0.12, len: 142, speed: 2600, alpha: 0.19, width: 2.9, ground: null }
+    ];
+
+    const glow = {
+      red: makeGlow(LIGHT.color.red),
+      amber: makeGlow(LIGHT.color.amber),
+      green: makeGlow(LIGHT.color.green),
+      head: makeGlow([255, 206, 150]),
+      tail: makeGlow([236, 64, 26])
+    };
+
+    let width = 1;
+    let height = 1;
+    let unit = 1; // screen pixels per art pixel
+    let originX = 0;
+    let originY = 0;
+
+    /** Art pixels -> screen pixels, through the same cover fit as the shader. */
+    const AX = (x) => originX + x * unit;
+    const AY = (y) => originY + y * unit;
+
+    function resize(w, h) {
+      width = w;
+      height = h;
+      const screenAspect = w / h;
+      const imageAspect = ART_W / ART_H;
+      const sx = screenAspect > imageAspect ? 1 : screenAspect / imageAspect;
+      // Cover keeps the scale equal on both axes, so one `unit` is enough.
+      unit = w / sx / ART_W;
+      originX = w / 2 - (ART_W / 2) * unit;
+      originY = h / 2 - (ART_H / 2) * unit;
+    }
+
+    // -- rain ----------------------------------------------------------------
+
+    const layers = RAIN.map((spec) => {
+      const n = Math.round(rainCount * spec.frac);
+      return {
+        spec,
+        n,
+        x: new Float32Array(n),
+        y: new Float32Array(n),
+        gy: new Float32Array(n)
+      };
+    });
+
+    const spawn = (layer, i, fromTop) => {
+      layer.x[i] = -500 + Math.random() * (ART_W + 620);
+      layer.y[i] = fromTop ? -Math.random() * 600 - layer.spec.len : Math.random() * ART_H;
+      layer.gy[i] = layer.spec.ground
+        ? lerp(layer.spec.ground[0], layer.spec.ground[1], Math.random())
+        : ART_H + layer.spec.len + 40;
+    };
+    for (const layer of layers) {
+      for (let i = 0; i < layer.n; i++) spawn(layer, i, false);
+    }
+
+    // -- splashes ------------------------------------------------------------
+
+    // A ring buffer: the oldest splash is overwritten rather than spliced, so
+    // the array never resizes and the cost per frame is fixed.
+    const SPLASH_MAX = 140;
+    const splashes = [];
+    for (let i = 0; i < SPLASH_MAX; i++) {
+      splashes.push({ x: 0, y: 0, t: 2, size: 1, gain: 1, tint: [200, 220, 240] });
+    }
+    let splashCursor = 0;
+    const plateMap = buildPlateMap(plate);
+
+    function addSplash(x, y, size, lampColor) {
+      const s = splashes[splashCursor];
+      splashCursor = (splashCursor + 1) % SPLASH_MAX;
+      s.x = x;
+      s.y = y;
+      s.t = 0;
+      s.size = size;
+
+      // What the water here is reflecting decides both how bright the ring can
+      // be and what colour it is. Lifting the sampled colour part-way toward
+      // white turns it from "the road" into "a highlight on the road".
+      const c = samplePlate(plateMap, x, y);
+      const lum = (c[0] * 0.35 + c[1] * 0.45 + c[2] * 0.2) / 255;
+      s.gain = 0.2 + 1.5 * lum;
+      s.tint = [c[0] + (255 - c[0]) * 0.4, c[1] + (255 - c[1]) * 0.4, c[2] + (255 - c[2]) * 0.4];
+
+      // The lamp's own reflection is painted by this file, not by the plate, so
+      // the map cannot know about it.
+      const inBeam = 1 - clamp01(Math.abs(x - LIGHT.x) / (40 + (y - 1440) * 0.3));
+      if (inBeam > 0) {
+        s.gain = Math.max(s.gain, 0.35 + inBeam * 0.5);
+        for (let k = 0; k < 3; k++) s.tint[k] = lerp(s.tint[k], lampColor[k], inBeam * 0.8);
+      }
+    }
+
+    // -- traffic light -------------------------------------------------------
+
+    const cycle = PHASES.reduce((sum, p) => sum + p[1], 0);
+    let lightClock = PHASES[0][1] * 0.55; // part-way into red, so boot is not a switch
+    let lampName = 'red';
+
+    function stepLight(dt) {
+      lightClock = (lightClock + dt) % cycle;
+      let t = lightClock;
+      for (const [name, seconds] of PHASES) {
+        if (t < seconds) {
+          lampName = name;
+          return;
+        }
+        t -= seconds;
+      }
+      lampName = PHASES[PHASES.length - 1][0];
+    }
+
+    // -- cab and passenger ---------------------------------------------------
+
+    // States run in order: away -> arrive -> transfer -> hold -> leave -> away.
+    // `hold` is where the light gets to matter: the cab has its fare and is
+    // ready, but it will not pull out into a red.
+    const cab = {
+      state: 'away',
+      timer: cabGap * 0.24, // first arrival soon after boot, not a full gap away
+      x: ART_W + 300,
+      ground: cabGroundY,
+      scale: 1,
+      boarding: true,
+      visible: false
+    };
+    const ARRIVE_SECONDS = 4.6;
+    const LEAVE_SECONDS = 7.4;
+    const WALK_SECONDS = 5.4;
+    const ENTRY_X = ART_W + 260;
+    const EXIT_X = -260;
+
+    // Where the passenger stands beside the rear door, and how the pavement
+    // drops toward the camera between the kiosk and the kerb.
+    const DOOR_X = () => cab.x + 22;
+    const DOOR_Y = 1431;
+
+    const ped = { active: false, t: 0, mode: 'board', alpha: 0, x: 0, y: 0, squash: 1, step: 0 };
+
+    function startTransfer() {
+      ped.active = true;
+      ped.t = 0;
+      ped.mode = cab.boarding ? 'board' : 'alight';
+      ped.step = 0;
+    }
+
+    /** Passenger path: kiosk door -> along the pavement -> out to the cab door. */
+    function walkPoint(f) {
+      const x = lerp(KIOSK_DOOR_X, DOOR_X(), f);
+      const y = lerp(KIOSK_DOOR_Y, DOOR_Y, smooth(0.35, 1, f));
+      return { x, y };
+    }
+
+    function stepCab(dt) {
+      if (!cabEnabled) return;
+      cab.timer -= dt;
+
+      if (cab.state === 'away') {
+        cab.visible = false;
+        if (cab.timer <= 0) {
+          cab.state = 'arrive';
+          cab.timer = ARRIVE_SECONDS;
+          cab.ground = cabGroundY;
+          cab.scale = 1;
+        }
+        return;
+      }
+
+      cab.visible = true;
+
+      if (cab.state === 'arrive') {
+        const p = clamp01(1 - cab.timer / ARRIVE_SECONDS);
+        const ease = 1 - Math.pow(1 - p, 3); // decelerates into the kerb
+        cab.x = lerp(ENTRY_X, cabStopX, ease);
+        if (cab.timer <= 0) {
+          cab.x = cabStopX;
+          cab.state = 'transfer';
+          cab.timer = WALK_SECONDS + 2.6;
+          startTransfer();
+        }
+        return;
+      }
+
+      if (cab.state === 'transfer') {
+        cab.x = cabStopX;
+        if (cab.timer <= 0) cab.state = 'hold';
+        return;
+      }
+
+      if (cab.state === 'hold') {
+        cab.x = cabStopX;
+        if (lampName === 'green') {
+          cab.state = 'leave';
+          cab.timer = LEAVE_SECONDS;
+        }
+        return;
+      }
+
+      if (cab.state === 'leave') {
+        const p = clamp01(1 - cab.timer / LEAVE_SECONDS);
+        cab.x = lerp(cabStopX, EXIT_X, p * p * (3 - 2 * p) * (0.35 + 0.65 * p));
+        // Pulling out of a kerb swings the car into the lane, which here means
+        // a little nearer the camera - so it sits lower and gets slightly bigger.
+        const out = smooth(0, 0.3, p);
+        cab.ground = cabGroundY + out * 28;
+        cab.scale = 1 + out * 0.09;
+        if (cab.timer <= 0) {
+          cab.state = 'away';
+          cab.visible = false;
+          cab.boarding = !cab.boarding;
+          cab.timer = cabGap + Math.random() * cabGapJitter;
+          cab.x = ENTRY_X;
+        }
+      }
+    }
+
+    function stepPed(dt) {
+      if (!ped.active) return;
+      ped.t += dt;
+
+      const fadeIn = 0.6;
+      const walkFrom = ped.mode === 'board' ? 0.35 : 0.9;
+      const walkTo = walkFrom + WALK_SECONDS;
+
+      if (ped.mode === 'board') {
+        const f = clamp01((ped.t - walkFrom) / WALK_SECONDS);
+        const p = walkPoint(f);
+        ped.x = p.x;
+        ped.y = p.y;
+        ped.step += f > 0 && f < 1 ? dt * 7.4 : 0;
+        // Fade in at the kiosk door, then duck into the car at the far end.
+        const entering = clamp01((ped.t - (walkTo + 0.45)) / 0.7);
+        ped.alpha = smooth(0, fadeIn, ped.t) * (1 - entering);
+        ped.squash = 1 - entering * 0.45;
+        if (entering >= 1) ped.active = false;
+      } else {
+        const f = 1 - clamp01((ped.t - walkFrom) / WALK_SECONDS);
+        const p = walkPoint(f);
+        ped.x = p.x;
+        ped.y = p.y;
+        ped.step += f > 0 && f < 1 ? dt * 7.4 : 0;
+        const leaving = clamp01((ped.t - walkFrom) / 0.9);
+        ped.alpha = leaving * (1 - clamp01((ped.t - (walkTo + 0.5)) / 0.8));
+        ped.squash = 0.55 + 0.45 * leaving;
+        if (ped.t > walkTo + 1.4) ped.active = false;
+      }
+    }
+
+    function update(dt) {
+      stepLight(dt);
+      stepCab(dt);
+      stepPed(dt);
+
+      const lampColor = LIGHT.color[lampName];
+      for (const layer of layers) {
+        const { spec } = layer;
+        const vy = spec.speed * rainSpeed * dt;
+        const vx = vy * rainSlant;
+        for (let i = 0; i < layer.n; i++) {
+          layer.y[i] += vy;
+          layer.x[i] += vx;
+          if (layer.y[i] >= layer.gy[i]) {
+            if (spec.ground && Math.random() < splashChance) {
+              addSplash(layer.x[i], layer.gy[i], 0.6 + (layer.gy[i] - 1400) / 150, lampColor);
+            }
+            spawn(layer, i, true);
+          } else if (layer.x[i] > ART_W + 130) {
+            layer.x[i] -= ART_W + 620;
+          }
+        }
+      }
+
+      for (const s of splashes) if (s.t < 2) s.t += dt;
+    }
+
+    // -- drawing -------------------------------------------------------------
+
+    function drawRain() {
+      const dx = -rainSlant / Math.hypot(rainSlant, 1);
+      const dy = -1 / Math.hypot(rainSlant, 1);
+      ctx.lineCap = 'butt';
+      for (const layer of layers) {
+        const { spec } = layer;
+        const len = spec.len * unit;
+        ctx.beginPath();
+        for (let i = 0; i < layer.n; i++) {
+          const x = AX(layer.x[i]);
+          const y = AY(layer.y[i]);
+          ctx.moveTo(x, y);
+          ctx.lineTo(x + dx * len, y + dy * len);
+        }
+        // One stroke per layer: overlapping streaks inside a single path
+        // composite once, so the rain never bunches into bright knots.
+        ctx.strokeStyle = rgba([196, 222, 246], Math.min(1, spec.alpha * rainOpacity));
+        ctx.lineWidth = Math.max(1, spec.width * unit);
+        ctx.stroke();
+      }
+    }
+
+    function drawSplashes() {
+      ctx.lineCap = 'butt';
+      for (const s of splashes) {
+        if (s.t >= 1) continue;
+        const p = s.t;
+        const x = AX(s.x);
+        const y = AY(s.y);
+
+        // The ring: a flattened ellipse, because the road is seen almost edge
+        // on. It fades on a steep curve so it is a disturbance passing through
+        // rather than a circle someone drew.
+        const r = (1.5 + p * 15 * s.size) * unit;
+        ctx.beginPath();
+        ctx.ellipse(x, y, r, r * 0.26, 0, 0, TAU);
+        ctx.strokeStyle = rgba(s.tint, 0.32 * s.gain * Math.pow(1 - p, 2.4));
+        ctx.lineWidth = Math.max(1, 1.4 * unit);
+        ctx.stroke();
+
+        // The tick: the fleck of the drop actually bouncing, gone in a tenth of
+        // a second. It has to stay a single near-vertical spurt - two splayed
+        // strokes read as a little tick mark drawn on the road.
+        if (p < 0.16) {
+          const a = 1 - p / 0.16;
+          const h = 6 * unit * s.size * a;
+          ctx.beginPath();
+          ctx.moveTo(x, y);
+          ctx.lineTo(x + h * 0.22, y - h);
+          ctx.strokeStyle = rgba(s.tint, 0.46 * s.gain * a);
+          ctx.lineWidth = Math.max(1, 1.2 * unit);
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.ellipse(x, y, 1.8 * unit * s.size, 1 * unit * s.size, 0, 0, TAU);
+          ctx.fillStyle = rgba(s.tint, 0.5 * s.gain * a);
+          ctx.fill();
+        }
+      }
+    }
+
+    /**
+     * The plate has the red lamp lit and baked in, so showing green means
+     * hiding red first. Rather than guess a flat colour for the dark lens, the
+     * amber lamp - an unlit lens in the same housing, one pitch below - is
+     * blitted from the source image over the red one. It matches by
+     * construction: same paint, same edges, same anti-aliasing.
+     */
+    function paintLight(time) {
+      const { patch, x: lx } = LIGHT;
+      const py = LIGHT.lensY.amber - patch.h / 2;
+      ctx.drawImage(
+        plate,
+        patch.x, py, patch.w, patch.h,
+        AX(patch.x), AY(LIGHT.lensY.red - patch.h / 2), patch.w * unit, patch.h * unit
+      );
+
+      const color = LIGHT.color[lampName];
+      const cy = LIGHT.lensY[lampName];
+      const pulse = 0.94 + 0.06 * Math.sin(time * 1.6);
+
+      ctx.beginPath();
+      ctx.arc(AX(lx), AY(cy), LIGHT.radius * unit, 0, TAU);
+      ctx.fillStyle = rgba(color, 1);
+      ctx.fill();
+      // The side visor, seen almost edge on - a sliver of the same lamp.
+      ctx.fillStyle = rgba(color, 0.34);
+      ctx.fillRect(AX(2082), AY(cy - 3), 12 * unit, 6 * unit);
+
+      // Two passes: a tight core that sits on the lens, and a wide halo that is
+      // the light actually reaching the wet air around it.
+      ctx.globalCompositeOperation = 'lighter';
+      const sprite = glow[lampName];
+      for (const [span, alpha] of [[46, 0.6], [190, 0.3]]) {
+        const s = span * unit * pulse;
+        ctx.globalAlpha = alpha;
+        ctx.drawImage(sprite, AX(lx) - s / 2, AY(cy) - s / 2, s, s);
+      }
+      ctx.globalAlpha = 1;
+      ctx.globalCompositeOperation = 'source-over';
+    }
+
+    /**
+     * A reflection on wet tarmac: a stack of slivers running away from the
+     * source, each shifted sideways by the surface wobble. Broken into slivers
+     * because an unbroken streak looks like a spotlight, not like water - and
+     * each sliver is a soft sprite overlapping its neighbours, because a stack
+     * of hard-edged rectangles looks like a staircase.
+     */
+    function drawReflection(artX, topY, color, strength, spread, time) {
+      const steps = 22;
+      const span = ART_H - topY;
+      const sprite = makeSliver(color);
+      ctx.globalCompositeOperation = 'lighter';
+      for (let i = 0; i < steps; i++) {
+        const f = i / (steps - 1);
+        const y = topY + f * span;
+        const wob = Math.sin(y * 0.085 + time * 1.9) * 3.4 + Math.sin(y * 0.029 - time * 1.15) * 5.2;
+        const a = strength * Math.pow(1 - f, 1.3) * (0.7 + 0.3 * Math.sin(y * 0.21 - time * 2.4));
+        if (a <= 0.002) continue;
+        const w = spread * (1 + f * 2.4);
+        const h = (span / steps) * 2.8;
+        ctx.globalAlpha = a;
+        ctx.drawImage(sprite, AX(artX + wob - w / 2), AY(y - h / 2), w * unit, h * unit);
+      }
+      ctx.globalAlpha = 1;
+      ctx.globalCompositeOperation = 'source-over';
+    }
+
+    /** Flat side view, no outlines and no gradients, to match the plate's style. */
+    function drawCab(time) {
+      const c = CAB;
+      const s = cabScale * cab.scale;
+
+      drawReflection(cab.x, cab.ground + 14, [214, 104, 48], 0.1, 74 * s, time + 3.1);
+
+      ctx.save();
+      ctx.translate(AX(cab.x), AY(cab.ground));
+      ctx.scale(unit * s, unit * s);
+
+      // Tyres go down first and the body is painted over them, so all that
+      // survives is the crescent inside each wheel arch and the tread below the
+      // sill. Stamping the discs on top instead reads as wheels bolted to the
+      // outside of the car.
+      for (const ax of [c.frontAxle, c.rearAxle]) {
+        ctx.fillStyle = 'rgb(4, 4, 10)';
+        ctx.beginPath();
+        ctx.arc(ax, c.wheelY, c.wheelR, 0, TAU);
+        ctx.fill();
+        // The hubcap is what makes a dark blob read as a wheel at this size.
+        ctx.fillStyle = 'rgb(62, 68, 86)';
+        ctx.beginPath();
+        ctx.arc(ax, c.wheelY, 5, 0, TAU);
+        ctx.fill();
+      }
+
+      // Body, traced clockwise from the front bumper: nose, bonnet, windscreen,
+      // roof, backlight, boot lid, rear bumper, then home along the sill with an
+      // arch cut out over each axle.
+      ctx.save();
+      ctx.beginPath();
+      ctx.moveTo(-c.half, -26);
+      ctx.lineTo(-c.half, -33);
+      ctx.lineTo(-92, c.deck + 2);
+      ctx.lineTo(c.screenBase, c.deck + 2);
+      // Rounded roof corners. A sharp trapezoid cabin is the single thing that
+      // makes a flat car read as a cartoon rather than as this illustration.
+      ctx.lineTo(c.roofFront - 3, c.roof + 5);
+      ctx.quadraticCurveTo(c.roofFront, c.roof, c.roofFront + 7, c.roof);
+      ctx.lineTo(c.roofBack - 6, c.roof);
+      ctx.quadraticCurveTo(c.roofBack, c.roof, c.roofBack + 4, c.roof + 6);
+      ctx.lineTo(c.pillarBase, c.deck);
+      ctx.lineTo(101, c.deck);
+      ctx.lineTo(c.half, -30);
+      ctx.lineTo(c.half, c.sill);
+      ctx.lineTo(c.rearAxle + c.archR, c.sill);
+      ctx.arc(c.rearAxle, c.sill, c.archR, 0, Math.PI, true);
+      ctx.lineTo(c.frontAxle + c.archR, c.sill);
+      ctx.arc(c.frontAxle, c.sill, c.archR, 0, Math.PI, true);
+      ctx.lineTo(-c.half, c.sill);
+      ctx.closePath();
+      ctx.clip();
+
+      // Two flat tones with a hard edge at the waist - the same trick the plate
+      // uses on the kiosk and the awning - painted inside the body outline.
+      ctx.fillStyle = 'rgb(184, 84, 34)';
+      ctx.fillRect(-c.half, c.roof - 16, 2 * c.half, 80);
+      ctx.fillStyle = 'rgb(122, 48, 20)';
+      ctx.fillRect(-c.half, c.belt, 2 * c.half, -c.belt);
+      ctx.fillStyle = 'rgb(168, 122, 100)';
+      ctx.fillRect(-75, c.belt - 1.5, 174, 1.5);
+      // Door shuts. Without them the flank is one uninterrupted slab, which is
+      // what makes a flat car look like a brick with wheels.
+      ctx.fillStyle = 'rgb(96, 36, 16)';
+      ctx.fillRect(-22, c.belt, 1.2, -c.belt + c.sill);
+      ctx.fillRect(30, c.belt, 1.2, -c.belt + c.sill);
+      ctx.fillStyle = 'rgb(12, 7, 9)';
+      ctx.fillRect(-c.half, c.sill - 3, 2 * c.half, 3);
+      // Bumpers: dark blocks at both ends, sitting below the body line.
+      ctx.fillStyle = 'rgb(40, 21, 18)';
+      ctx.fillRect(-c.half, -22, 17, 11);
+      ctx.fillRect(c.half - 15, -22, 15, 11);
+      ctx.restore();
+
+      // Glasshouse.
+      ctx.fillStyle = 'rgb(6, 26, 48)';
+      ctx.beginPath();
+      ctx.moveTo(c.screenBase + 8, c.belt - 5);
+      ctx.lineTo(c.roofFront + 5, c.roof + 5);
+      ctx.lineTo(4, c.roof + 5);
+      ctx.lineTo(4, c.belt - 5);
+      ctx.closePath();
+      ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(11, c.belt - 5);
+      ctx.lineTo(11, c.roof + 5);
+      ctx.lineTo(c.roofBack - 5, c.roof + 5);
+      ctx.lineTo(c.pillarBase - 9, c.belt - 5);
+      ctx.closePath();
+      ctx.fill();
+
+      // Roof sign.
+      ctx.fillStyle = 'rgb(237, 143, 19)';
+      ctx.fillRect(-11, c.roof - 14, 12.5, 14);
+
+      // Lamp lenses. Small and solid; the soft part is one pass further down.
+      ctx.fillStyle = 'rgb(202, 176, 146)';
+      ctx.fillRect(-c.half + 2, -32, 8, 4.5);
+      ctx.fillStyle = 'rgb(198, 58, 26)';
+      ctx.fillRect(c.half - 9, -36, 6.5, 6.5);
+      ctx.restore();
+
+      // Headlights and tail lights, and the pool the headlights throw onto the
+      // wet road ahead. Brighter while the car is actually moving.
+      const moving = cab.state === 'arrive' || cab.state === 'leave';
+      ctx.globalCompositeOperation = 'lighter';
+
+      const headSize = (moving ? 190 : 130) * unit * s;
+      ctx.globalAlpha = moving ? 0.5 : 0.34;
+      ctx.drawImage(
+        glow.head,
+        AX(cab.x - c.half * s) - headSize * 0.66,
+        AY(cab.ground - 33 * s) - headSize / 2,
+        headSize, headSize
+      );
+      const poolW = 150 * unit * s;
+      ctx.globalAlpha = moving ? 0.26 : 0.16;
+      ctx.drawImage(
+        glow.head,
+        AX(cab.x - (c.half + 60) * s) - poolW / 2,
+        AY(cab.ground + 10 * s) - poolW * 0.11,
+        poolW, poolW * 0.22
+      );
+
+      const tailSize = 90 * unit * s;
+      ctx.globalAlpha = moving ? 0.44 : 0.32;
+      ctx.drawImage(
+        glow.tail,
+        AX(cab.x + c.half * s) - tailSize * 0.44,
+        AY(cab.ground - 35 * s) - tailSize / 2,
+        tailSize, tailSize
+      );
+      ctx.globalAlpha = 1;
+      ctx.globalCompositeOperation = 'source-over';
+    }
+
+    /**
+     * Passenger: the same solid, outline-free silhouette as the plate's own
+     * figures, and built to their measurements - 88 art pixels tall, with a
+     * head only a tenth of that. Guessing those proportions produces a figure
+     * that reads as a different illustration standing in the same picture.
+     */
+    function drawPed() {
+      if (!ped.active || ped.alpha <= 0.01) return;
+      // A walking stride at this size is nearly closed: the plate's own figures
+      // read as one tapering column below the coat, not a pair of compasses.
+      const swing = Math.sin(ped.step) * 4.2;
+
+      ctx.save();
+      ctx.translate(AX(ped.x), AY(ped.y));
+      ctx.scale(unit, unit * ped.squash);
+      ctx.globalAlpha = ped.alpha;
+      ctx.fillStyle = 'rgb(4, 8, 18)';
+      ctx.strokeStyle = 'rgb(4, 8, 18)';
+      ctx.lineCap = 'round';
+
+      ctx.lineWidth = 5;
+      ctx.beginPath();
+      ctx.moveTo(-1, -44);
+      ctx.lineTo(swing, -3);
+      ctx.moveTo(1, -44);
+      ctx.lineTo(-swing, -3);
+      ctx.stroke();
+
+      // Coat: sloped shoulders, widest at the elbows, tucked in at the hem.
+      ctx.beginPath();
+      ctx.moveTo(-4.5, -77);
+      ctx.quadraticCurveTo(-9, -74, -9.5, -66);
+      ctx.lineTo(-9, -47);
+      ctx.lineTo(-6, -42);
+      ctx.lineTo(6, -42);
+      ctx.lineTo(9, -47);
+      ctx.lineTo(9.5, -66);
+      ctx.quadraticCurveTo(9, -74, 4.5, -77);
+      ctx.closePath();
+      ctx.fill();
+
+      // The swinging arm only breaks the coat's outline, which is all the walk
+      // needs to read at 88 pixels tall.
+      ctx.lineWidth = 3.4;
+      ctx.beginPath();
+      ctx.moveTo(3, -71);
+      ctx.lineTo(-swing * 1.4, -50);
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.ellipse(0, -81, 3.5, 5.2, 0, 0, TAU);
+      ctx.fill();
+      ctx.restore();
+      ctx.globalAlpha = 1;
+    }
+
+    function draw(time) {
+      ctx.clearRect(0, 0, width, height);
+
+      paintLight(time);
+      drawReflection(LIGHT.x, 1442, LIGHT.color[lampName], 0.15, 26, time);
+
+      if (cab.visible) drawCab(time);
+      drawPed();
+
+      drawSplashes();
+      drawRain();
+    }
+
+    return { resize, update, draw };
+  }
+
+  // ---------------------------------------------------------------------------
+
+  async function boot() {
+    const config = await window.wallpaperForge.getConfig();
+    if (!config || !config.wallpaper) return fail('No wallpaper assigned.');
+    const properties = config.wallpaper.properties || {};
+
+    const gl = glCanvas.getContext('webgl2', {
+      antialias: false,
+      alpha: false,
+      powerPreference: 'low-power'
+    });
+    if (!gl) return fail('WebGL2 is not available on this machine.');
+
+    // Same origin as this page, so no CORS opt-in is needed for the upload.
+    const image = await loadImage('media/plate.png');
+
+    const program = buildProgram(gl);
+    gl.useProgram(program);
+
+    const buffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+    const aPos = gl.getAttribLocation(program, 'aPos');
+    gl.enableVertexAttribArray(aPos);
+    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+    const texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false); // uv.y = 0 is the top of the image
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+    const u = (name) => gl.getUniformLocation(program, name);
+    const uniforms = { resolution: u('uResolution'), time: u('uTime') };
+
+    gl.uniform1i(u('uImage'), 0);
+    gl.uniform1f(u('uImageAspect'), image.width / image.height);
+    gl.uniform1f(u('uRoadY'), num(properties.roadY, 0.884));
+    gl.uniform1f(u('uWobble'), 0.0016 * num(properties.wobbleStrength, 1));
+    gl.uniform1f(u('uRipple'), 0.0013 * num(properties.rippleStrength, 1));
+    gl.uniform1f(u('uRippleRate'), num(properties.rippleRate, 1));
+    gl.uniform1f(u('uShimmer'), 0.2 * num(properties.shimmerStrength, 1));
+
+    const overlay = createOverlay(fxCanvas, image, properties);
+
+    function resize() {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const w = Math.max(1, Math.round(window.innerWidth * dpr));
+      const h = Math.max(1, Math.round(window.innerHeight * dpr));
+      for (const canvas of [glCanvas, fxCanvas]) {
+        canvas.width = w;
+        canvas.height = h;
+      }
+      gl.viewport(0, 0, w, h);
+      gl.uniform2f(uniforms.resolution, w, h);
+      overlay.resize(w, h);
+    }
+    resize();
+    window.addEventListener('resize', resize);
+
+    let raf = null;
+    let last = performance.now();
+    let clock = 0;
+
+    function frame(now) {
+      raf = requestAnimationFrame(frame);
+      const dt = Math.min(0.05, (now - last) / 1000);
+      last = now;
+      clock += dt;
+
+      gl.uniform1f(uniforms.time, clock);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+      overlay.update(dt);
+      overlay.draw(clock);
+    }
+
+    function start() {
+      if (raf !== null) return;
+      last = performance.now();
+      raf = requestAnimationFrame(frame);
+    }
+    function stop() {
+      if (raf === null) return;
+      cancelAnimationFrame(raf);
+      raf = null;
+    }
+
+    // This runs 24/7 behind the desktop, so a live rAF while paused would burn
+    // CPU forever.
+    window.wallpaperForge.onPause((paused) => (paused ? stop() : start()));
+    if (!window.wallpaperForge.isPaused()) start();
+  }
+
+  boot().catch((err) => fail(String(err && err.message ? err.message : err)));
+</script>

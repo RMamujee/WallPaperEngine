@@ -1,0 +1,783 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Aerial Shore</title>
+<style>
+  html,
+  body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #0c3b42;
+  }
+  canvas {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+  #error {
+    position: fixed;
+    inset: 0;
+    display: none;
+    place-content: center;
+    font: 500 15px/1.6 system-ui, sans-serif;
+    color: #8b93a7;
+    text-align: center;
+    padding: 8vh 10vw;
+  }
+</style>
+<canvas id="gl"></canvas>
+<canvas id="fx"></canvas>
+<div id="error"></div>
+
+<script>
+  /**
+   * Aerial Shore: a top-down tropical coastline animated in place.
+   *
+   * The viewpoint is what drives every choice here. The camera looks straight
+   * down, so there is no horizon and no sky, and the shoreline runs vertically
+   * down the frame at about x = 0.5. Nothing may be gated on "above/below the
+   * horizon" the way a landscape wallpaper would be; the bands are vertical.
+   *
+   *   - the canopy sways by CURL, not by translation. From overhead a palm crown
+   *     does not slide sideways, it splays and twists about its own centre, so
+   *     the displacement field is the curl of a cellular potential: a lattice of
+   *     little vortices roughly one crown across. Gusts travel through the
+   *     canopy by phase-shifting each cell's oscillation along the gust
+   *     direction, so the forest ripples in sequence instead of in lockstep
+   *   - which pixels count as leaf, water, or beach is decided by the plate's
+   *     own colour, the trick living.html uses for vegetation. Here g - b sorts
+   *     foliage (strongly positive) from water (zero or negative), and a
+   *     paleness cap throws out the sand, which is just as green-over-blue as
+   *     the jungle but four times brighter. See leafiness() and wetness()
+   *   - the masks are read from a BLURRED mip level, not from the sharp plate.
+   *     A colour mask sampled sharp has hard edges, a hard-edged mask makes a
+   *     discontinuous sampling offset, and a discontinuous offset is a tear. At
+   *     LOD 2 the masks vary over a few pixels and every offset is smooth
+   *   - the swell travels LEFTWARD, perpendicular to the vertical shoreline,
+   *     with its amplitude scaled by how shallow the water is - which is read
+   *     off the plate's own brightness, since this artist painted the shallows
+   *     bright turquoise and the deep water dark teal
+   *   - the foam line is modulated rather than invented: a travelling phase
+   *     brightens paint that is already pale, so the printed surf lights up in
+   *     advancing bands. On the sand a wash runs up and retreats, thinning as it
+   *     goes, its reach measured by marching seaward off the plate
+   *   - fish shadows live on a 2D overlay, which stays crisp and cheap
+   *
+   * Every tuning number is a property in wallpaper.json.
+   */
+
+  const errorBox = document.getElementById('error');
+  const glCanvas = document.getElementById('gl');
+  const fxCanvas = document.getElementById('fx');
+
+  function fail(message) {
+    errorBox.textContent = message;
+    errorBox.style.display = 'grid';
+  }
+
+  const VERT = `#version 300 es
+  in vec2 aPos;
+  out vec2 vUv;
+  void main() {
+    // Y is flipped so uv.y = 0 is the TOP of both the screen and the texture.
+    // The texture half of that comes from uploading with UNPACK_FLIP_Y off,
+    // which puts the image's first row at t = 0. Without this the plate renders
+    // upside down and every band test below points at the wrong thing.
+    vUv = vec2(aPos.x * 0.5 + 0.5, 0.5 - aPos.y * 0.5);
+    gl_Position = vec4(aPos, 0.0, 1.0);
+  }`;
+
+  const FRAG = `#version 300 es
+  precision highp float;
+
+  // Steps taken when measuring how far a beach pixel is from the water. Five
+  // spans the whole sand strip at the default step and is cheap enough to run
+  // over the beach every frame.
+  #define MARCH 5
+
+  in vec2 vUv;
+  out vec4 fragColor;
+
+  uniform sampler2D uImage;
+  uniform vec2  uResolution;
+  uniform float uImageAspect;
+  uniform float uMaskLod;
+
+  /**
+   * There is no clock uniform here on purpose.
+   *
+   * This wallpaper runs for weeks at a time, and a float32 holding the elapsed
+   * seconds loses its grip long before that: one ULP at 24 hours is already
+   * 8 ms, which is half a frame, so the motion starts advancing in visible
+   * steps, and at a week the clock cannot represent a frame at all. Multiplying
+   * that clock by a frequency to make a phase only makes it worse, and GPU sin()
+   * is not dependable at arguments of a million radians either.
+   *
+   * So every phase is accumulated on the CPU in double precision, reduced modulo
+   * two pi there, and arrives here already small. What is left in the shader is
+   * purely spatial. The two components that depend on nothing but time - the set
+   * size and the swash cycle - are evaluated on the CPU outright and arrive as
+   * plain values.
+   */
+  uniform vec4  uCanopyT;      // phases: gust, gust harmonic, twist 1, twist 2
+  uniform vec4  uWaveT;        // phases: crest bend 1, crest bend 2, swell, swell harmonic
+  uniform vec4  uShoreT;       // phase: foam band, swash cusp; value: set size, swash cycle
+
+  // --- canopy ---
+  uniform float uSway;         // curl amplitude, in aspect-true units
+  uniform float uCrownScale;   // lattice period; vortices sit half this apart
+  uniform float uCrownBoost;   // extra sway for the bright yellow-green crowns
+  uniform float uSplay;        // radial (splaying) fraction of the warp
+  uniform vec2  uGustDir;      // unit direction gusts travel across the canopy
+  uniform float uGustK;        // 2 pi / gust wavelength
+  uniform vec2  uCanopyEdge;   // image X where the foliage gate fades out
+  uniform vec2  uGreenGate;    // g - b range that counts as leaf
+
+  // --- water ---
+  uniform vec2  uSwellDir;     // unit travel direction, points at the beach
+  uniform float uSwell;
+  uniform float uSwellK;       // 2 pi / swell wavelength
+  uniform float uFoamK;        // 2 pi / foam-band wavelength
+  uniform float uFoamGain;
+  uniform float uShallowGain;
+  uniform vec2  uWaterEdge;    // image X where the water gate fades in
+  uniform vec2  uDepthLum;     // blurred luminance: deep water -> shallow water
+
+  // --- run-up ---
+  uniform float uFoamReach;
+  uniform float uRunFeather;
+  uniform float uRunStep;
+  uniform float uLipGain;
+  uniform float uWashPush;
+  uniform vec2  uBeachEdge;    // image X span of the sand and shingle
+  uniform vec2  uBeachLum;     // blurred luminance that counts as beach
+
+  // --- grading ---
+  uniform float uParallax;
+  uniform vec2  uCursor;
+  uniform float uVignette;
+  uniform float uSaturate;
+  uniform float uBrightness;
+
+  /** Screen UV -> image UV for a cover (crop) fit. */
+  vec2 coverUv(vec2 uv) {
+    float screenAspect = uResolution.x / uResolution.y;
+    vec2 scale = screenAspect > uImageAspect
+      ? vec2(1.0, uImageAspect / screenAspect)
+      : vec2(screenAspect / uImageAspect, 1.0);
+    return (uv - 0.5) * scale + 0.5;
+  }
+
+  float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+
+  float saturation(vec3 c) {
+    float hi = max(c.r, max(c.g, c.b));
+    float lo = min(c.r, min(c.g, c.b));
+    return hi <= 0.0001 ? 0.0 : (hi - lo) / hi;
+  }
+
+  /**
+   * How much this pixel behaves as jungle canopy.
+   *
+   * Measured off the plate: dark jungle runs g - b around 0.06 and the bright
+   * palm crowns 0.29, while the rocks sit at 0.02 and the water at 0.01 or
+   * below. That one difference does almost all the work.
+   *
+   * The exception is the sand, which is 0.14 on the same test - warm paint is
+   * green-over-blue too. It is separated by brightness instead: no foliage on
+   * this plate is brighter than 0.50 luma and no sand is darker than 0.66. The
+   * saturation term is belt and braces for the driftwood and the grey shingle,
+   * which the blur can otherwise smear a little green.
+   */
+  float leafiness(vec3 c, float x) {
+    float green = smoothstep(uGreenGate.x, uGreenGate.y, c.g - c.b);
+    float vivid = smoothstep(0.20, 0.40, saturation(c));
+    float notPale = 1.0 - smoothstep(0.53, 0.66, luma(c));
+    float inland = 1.0 - smoothstep(uCanopyEdge.x, uCanopyEdge.y, x);
+    return green * vivid * notPale * inland;
+  }
+
+  /**
+   * How much this pixel behaves as sea.
+   *
+   * g - r is what separates water from land here: every teal on the plate runs
+   * from 0.17 in the pale inner shallows to 0.47 out in the deep, while the
+   * sand is at -0.11 and the foam at -0.02. The threshold has to stay low
+   * enough to admit that inner wash - an earlier cut at 0.20 excluded it, which
+   * pushed the waterline the run-up marches for a hundred pixels offshore and
+   * stranded the whole swash out in the surf.
+   *
+   * Foliage is the one thing that also reads cool, so the second term throws
+   * out anything as strongly green-over-blue as a palm crown, and the X gate
+   * covers the dark understorey, which no threshold on colour alone can tell
+   * from deep water.
+   */
+  float wetness(vec3 c, float x) {
+    float cool = smoothstep(0.09, 0.22, c.g - c.r);
+    float notLeaf = 1.0 - smoothstep(0.10, 0.20, c.g - c.b);
+    float offshore = smoothstep(uWaterEdge.x, uWaterEdge.y, x);
+    return cool * notLeaf * offshore;
+  }
+
+  /** Pale, dry-ish, and not water: the strip the wash is allowed to run over. */
+  float beachness(vec3 c, float x, float water) {
+    float pale = smoothstep(uBeachLum.x, uBeachLum.y, luma(c));
+    float band = smoothstep(uBeachEdge.x - 0.03, uBeachEdge.x + 0.02, x)
+               * (1.0 - smoothstep(uBeachEdge.y - 0.06, uBeachEdge.y, x));
+    return pale * band * (1.0 - water);
+  }
+
+  /**
+   * Curl of the potential sin(k x) sin(k y), divided by k so the result is
+   * bounded by one. Divergence free, which is the whole point: the field has no
+   * net push in any direction, only rotation about the lattice of points where
+   * the potential peaks. Set the lattice spacing to a crown width and every
+   * crown twists about roughly its own centre.
+   */
+  vec2 curlCell(vec2 q, float k) {
+    return vec2(sin(k * q.x) * cos(k * q.y), -cos(k * q.x) * sin(k * q.y));
+  }
+
+  /**
+   * Gradient of the same potential, again scaled by 1/k. This one is curl free:
+   * it flows in and out of those same centres, which is the splaying half of
+   * what a palm crown does when the wind hits it from above.
+   */
+  vec2 gradCell(vec2 q, float k) {
+    return vec2(cos(k * q.x) * sin(k * q.y), sin(k * q.x) * cos(k * q.y));
+  }
+
+  void main() {
+    vec2 parallax = (uCursor - 0.5) * uParallax;
+    vec2 iuv = coverUv(vUv) + parallax * vec2(1.0, 0.6);
+
+    // Aspect-true space. Every wavelength, lattice spacing and heading below is
+    // quoted in these units, so a crown cell stays round instead of becoming an
+    // ellipse 1.6 times wider than it is tall.
+    vec2 p = vec2(iuv.x * uImageAspect, iuv.y);
+
+    // All three masks come from here. A blurred read is what keeps a colour mask
+    // from turning into a tear: at this LOD the mask varies over a few pixels,
+    // so the offset it gates is continuous everywhere.
+    vec3 blur = textureLod(uImage, clamp(iuv, 0.0, 1.0), uMaskLod).rgb;
+    float leaf = leafiness(blur, iuv.x);
+    float water = wetness(blur, iuv.x);
+    float beach = beachness(blur, iuv.x, water);
+
+    // --- canopy -----------------------------------------------------------
+    // One ramp along the gust direction does two jobs: paired with the gust
+    // phase it swells the amplitude as a gust passes, and paired with the twist
+    // phases it offsets each cell's oscillation, so a crown starts moving
+    // slightly after the crowns upwind of it and the forest ripples in sequence.
+    float gustRamp = dot(p, uGustDir) * uGustK;
+    float gust = 0.40 + 0.42 * (0.5 + 0.5 * sin(gustRamp - uCanopyT.x))
+               + 0.18 * sin(gustRamp * 0.37 - uCanopyT.y + 1.7);
+
+    // Warping the lattice input keeps it from reading as a grid. Small enough
+    // not to distort the cells, large enough to break the rows up.
+    vec2 q = p + vec2(sin(p.y * 3.7 + 0.9), sin(p.x * 4.3 + 2.1)) * 0.035;
+    vec2 q2 = mat2(0.80, -0.60, 0.60, 0.80) * q + vec2(3.1, 1.7);
+
+    float k1 = 6.2831853 / uCrownScale;
+    float k2 = k1 * 0.61;
+
+    // Two incommensurate rates, so the canopy never comes back round to a pose
+    // it has held before.
+    float osc1 = sin(gustRamp * 0.85 + uCanopyT.z);
+    float osc2 = sin(gustRamp * 1.27 + uCanopyT.w + 2.4);
+
+    vec2 twist = curlCell(q, k1) * osc1 + curlCell(q2, k2) * (0.75 * osc2);
+    vec2 splay = gradCell(q, k1) * (uSplay * osc2);
+
+    // The bright yellow-green crowns are the tall palms; they catch more wind
+    // than the dark understorey packed in around them.
+    float crown = smoothstep(0.14, 0.30, blur.g - blur.b);
+    vec2 canopyOff = (twist + splay) * (uSway * gust * leaf * (1.0 + uCrownBoost * crown));
+    canopyOff.x /= uImageAspect;
+
+    // --- water ------------------------------------------------------------
+    // Shallow water is painted bright turquoise and deep water dark teal, so
+    // the plate's own brightness is a usable depth map once it is blurred.
+    float depth = smoothstep(uDepthLum.x, uDepthLum.y, luma(blur));
+
+    // One shared cross-shore ramp, so the swell and the foam bands advance at
+    // the same speed despite having different wavelengths. The bend term stops
+    // the crests being one ruled line from the top of the frame to the bottom,
+    // which no real swell ever is.
+    float bend = 0.055 * sin(p.y * 5.3 + uWaveT.x) + 0.035 * sin(p.y * 11.1 - uWaveT.y);
+    float ramp = dot(p, -uSwellDir) + bend;
+    float phase = ramp * uSwellK + uWaveT.z;
+    // The companion term is a LONGER wave, not a harmonic. Steepness is
+    // amplitude times wavenumber, and a harmonic multiplies it by its own ratio;
+    // once that passes one the displacement folds the plate back over itself.
+    // It has to be rebuilt from the ramp rather than scaling phase, since phase
+    // already carries a wrapped time term that must not be scaled with it.
+    float swell = sin(phase) + 0.26 * sin(ramp * uSwellK * 0.57 + uWaveT.w + 2.2);
+
+    // uShoreT.z is the set size: two slow sines at an awkward ratio, so
+    // successive swells differ and the sequence has no period short enough to
+    // notice. It costs nothing here because the CPU already evaluated it.
+    float amp = uSwell * (0.30 + uShallowGain * depth) * uShoreT.z * water;
+    vec2 waterOff = uSwellDir * (swell * amp);
+    waterOff.x /= uImageAspect;
+
+    // --- run-up -----------------------------------------------------------
+    // How far inland a beach pixel is gets measured off the plate rather than
+    // assumed: march seaward and count how many steps are still not water. The
+    // painted waterline wanders by more than a wavelength between the top and
+    // the bottom of the frame, so a fixed X threshold would leave the wash
+    // stranded in the middle of the sand at one end of the shore.
+    float toWater = 1.0;
+    if (beach > 0.02) {
+      vec2 seaward = vec2(-uSwellDir.x / uImageAspect, -uSwellDir.y) * uRunStep;
+      float marched = 0.0;
+      for (int i = 1; i <= MARCH; i++) {
+        vec2 s = clamp(iuv + seaward * float(i), 0.0, 1.0);
+        marched += 1.0 - wetness(textureLod(uImage, s, uMaskLod).rgb, s.x);
+      }
+      toWater = marched / float(MARCH);
+    }
+
+    // A swash edge is never one straight line, and the cusp term also breaks up
+    // the shelves that five discrete march steps would otherwise leave behind.
+    float cusp = 0.85 + 0.15 * sin(p.y * 13.0 + uShoreT.y);
+    float front = uFoamReach * uShoreT.w * cusp;
+
+    // The painted foam line itself is nudged landward as the wash runs up, so
+    // the white edge advances instead of only brightening in place.
+    vec2 washOff = vec2(0.0);
+    washOff.x = uSwellDir.x * uWashPush * beach * (1.0 - smoothstep(0.10, 0.80, toWater)) * uShoreT.w;
+    washOff.x /= uImageAspect;
+
+    vec3 color = texture(uImage, clamp(iuv + canopyOff + waterOff + washOff, 0.0, 1.0)).rgb;
+
+    // Foam, modulated rather than drawn. Gating on paint that is already pale
+    // lights the printed surf lace one band at a time and leaves the flat
+    // turquoise between the bands alone, which is what keeps this looking like
+    // the illustration it is.
+    float painted = smoothstep(0.42, 0.72, luma(color));
+    float foamField = painted * water * uFoamGain * (0.35 + 0.65 * depth);
+    float foamPhase = ramp * uFoamK + uShoreT.x;
+    float crest = smoothstep(0.05, 0.90, sin(foamPhase));
+    float trough = smoothstep(0.05, 0.90, -sin(foamPhase));
+    color = mix(color, min(color * 1.15 + vec3(0.055, 0.07, 0.07), vec3(1.0)), crest * foamField);
+    color *= 1.0 - 0.045 * trough * foamField;
+
+    // Wet sand behind the front, thinning the further the wash has run so the
+    // leading edge dries out instead of stopping dead, and a pale lip riding on
+    // the front itself.
+    float reached = 1.0 - smoothstep(front - uRunFeather, front, toWater);
+    float thinning = 1.0 - 0.55 * smoothstep(0.0, 1.0, toWater);
+    float wet = reached * thinning * beach;
+    color = mix(color, color * vec3(0.80, 0.83, 0.86), wet * 0.42);
+
+    float lip = 1.0 - smoothstep(0.0, uRunFeather * 0.8, abs(toWater - front));
+    color = mix(color, vec3(0.95, 0.97, 0.97), lip * thinning * beach * uLipGain * 0.36);
+
+    color *= uBrightness;
+    color = mix(vec3(luma(color)), color, uSaturate);
+
+    float vig = 1.0 - uVignette * pow(length((vUv - 0.5) * vec2(1.05, 1.0)) * 1.32, 2.4);
+    color *= clamp(vig, 0.0, 1.0);
+
+    fragColor = vec4(color, 1.0);
+  }`;
+
+  function compile(gl, type, source) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      throw new Error(gl.getShaderInfoLog(shader) || 'shader compile failed');
+    }
+    return shader;
+  }
+
+  function buildProgram(gl) {
+    const program = gl.createProgram();
+    gl.attachShader(program, compile(gl, gl.VERTEX_SHADER, VERT));
+    gl.attachShader(program, compile(gl, gl.FRAGMENT_SHADER, FRAG));
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      throw new Error(gl.getProgramInfoLog(program) || 'program link failed');
+    }
+    return program;
+  }
+
+  function loadImage(src) {
+    return new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = () => reject(new Error(`Could not load ${src}`));
+      image.src = src;
+    });
+  }
+
+  const smoothstep = (a, b, x) => {
+    const t = Math.min(1, Math.max(0, (x - a) / (b - a || 1e-6)));
+    return t * t * (3 - 2 * t);
+  };
+
+  /**
+   * Fish shadows on the seabed, drawn on a 2D overlay above the shader.
+   *
+   * They are shadows, not fish: a soft dark blob is all that reaches the sand
+   * from a body swimming a couple of metres above it. Drawn with plain alpha
+   * over near-black, which for a black source is arithmetically the same as a
+   * multiply blend - the water is scaled down, its hue untouched.
+   *
+   * Fish belong to schools. A school holds a heading, eases toward a new one
+   * every ten seconds or so, and turns away from the shore and the frame edges
+   * before it can reach them. Members keep formation relative to that heading
+   * and wobble across it. Depth is read from how far offshore the school has
+   * wandered, and fainter, smaller and slower all follow from it.
+   */
+  function createOverlay(canvas, props, num, imageAspect) {
+    const ctx = canvas.getContext('2d');
+    const total = Math.max(0, Math.round(num(props.fish, 26)));
+    const schoolCount = Math.max(1, Math.round(num(props.fishSchools, 5)));
+    const speedMul = num(props.fishSpeed, 1);
+    const darkMul = num(props.fishDark, 0.34);
+    const sizeMul = num(props.fishSize, 1);
+    const bandX = Array.isArray(props.fishBandX) ? props.fishBandX : [];
+    const bandY = Array.isArray(props.fishBandY) ? props.fishBandY : [];
+    const x0 = num(bandX[0], 0.655);
+    const x1 = num(bandX[1], 0.985);
+    const y0 = num(bandY[0], 0.04);
+    const y1 = num(bandY[1], 0.96);
+
+    let width = 1;
+    let height = 1;
+    const rand = (a, b) => a + Math.random() * (b - a);
+
+    // One pre-blurred sprite, reused for every fish. A per-frame radial gradient
+    // per fish would cost far more than the blob is worth.
+    const sprite = (() => {
+      const S = 128;
+      const c = document.createElement('canvas');
+      c.width = S;
+      c.height = S;
+      const g = c.getContext('2d');
+      g.filter = 'blur(7px)';
+      g.fillStyle = 'rgb(2, 14, 20)';
+      g.beginPath();
+      g.ellipse(S * 0.48, S * 0.5, S * 0.24, S * 0.105, 0, 0, Math.PI * 2);
+      g.fill();
+      g.beginPath();
+      g.moveTo(S * 0.30, S * 0.5);
+      g.lineTo(S * 0.135, S * 0.415);
+      g.lineTo(S * 0.175, S * 0.5);
+      g.lineTo(S * 0.135, S * 0.585);
+      g.closePath();
+      g.fill();
+      return c;
+    })();
+
+    const schools = [];
+    for (let i = 0; i < schoolCount; i++) {
+      // Half the schools head roughly offshore and half roughly inshore, so the
+      // water never looks like it is all flowing one way.
+      const heading = Math.random() < 0.5 ? rand(2.55, 3.75) : rand(-0.6, 0.6);
+      schools.push({
+        x: rand(x0, x1),
+        y: rand(y0, y1),
+        heading,
+        target: heading,
+        timer: rand(3, 15),
+        spread: rand(0.016, 0.038),
+        speed: rand(0.8, 1.25)
+      });
+    }
+
+    const fish = [];
+    for (let i = 0; i < total; i++) {
+      fish.push({
+        school: i % schoolCount,
+        along: rand(-1, 1),
+        across: rand(-1, 1),
+        scale: rand(0.62, 1.35),
+        wob: Math.random() * Math.PI * 2,
+        wobRate: rand(2.1, 3.4)
+      });
+    }
+
+    function resize(w, h) {
+      width = w;
+      height = h;
+    }
+
+    /** Image UV -> screen pixels, the inverse of the shader's cover fit. */
+    function toScreen(ix, iy) {
+      const screenAspect = width / height;
+      const sx = screenAspect > imageAspect ? 1 : screenAspect / imageAspect;
+      const sy = screenAspect > imageAspect ? imageAspect / screenAspect : 1;
+      return [((ix - 0.5) / sx + 0.5) * width, ((iy - 0.5) / sy + 0.5) * height];
+    }
+
+    function update(dt) {
+      const marginX = 0.08 * (x1 - x0);
+      const marginY = 0.10 * (y1 - y0);
+      for (const s of schools) {
+        s.timer -= dt;
+        if (s.timer <= 0) {
+          s.timer = rand(6, 18);
+          s.target = s.heading + rand(-1.0, 1.0);
+        }
+        // Steering, not bouncing: a school that drifts toward the surf or the
+        // frame edge is given an inward heading and turns onto it over several
+        // seconds, which is the only part of this that must never look abrupt.
+        if (s.x < x0 + marginX) s.target = rand(-0.5, 0.5);
+        else if (s.x > x1 - marginX) s.target = Math.PI + rand(-0.5, 0.5);
+        if (s.y < y0 + marginY) s.target = Math.PI * 0.5 + rand(-0.5, 0.5);
+        else if (s.y > y1 - marginY) s.target = -Math.PI * 0.5 + rand(-0.5, 0.5);
+
+        let d = s.target - s.heading;
+        while (d > Math.PI) d -= Math.PI * 2;
+        while (d < -Math.PI) d += Math.PI * 2;
+        s.heading += d * Math.min(1, dt * 0.4);
+
+        const deep = smoothstep(0.68, 0.95, s.x);
+        const v = (0.0075 + 0.0055 * (1 - deep)) * s.speed * speedMul;
+        s.x = Math.min(1.02, Math.max(-0.02, s.x + (Math.cos(s.heading) * v * dt) / imageAspect));
+        s.y = Math.min(1.02, Math.max(-0.02, s.y + Math.sin(s.heading) * v * dt));
+      }
+      for (const f of fish) f.wob += f.wobRate * dt;
+    }
+
+    function draw() {
+      ctx.clearRect(0, 0, width, height);
+      for (const f of fish) {
+        const s = schools[f.school];
+        const deep = smoothstep(0.68, 0.95, s.x);
+        const cos = Math.cos(s.heading);
+        const sin = Math.sin(s.heading);
+
+        const along = f.along * s.spread * 1.7;
+        const across = (f.across + Math.sin(f.wob) * 0.3) * s.spread;
+        const ix = s.x + (cos * along - sin * across) / imageAspect;
+        const iy = s.y + (sin * along + cos * across);
+        if (ix < x0 - 0.06 || ix > x1 + 0.06) continue;
+
+        const [px, py] = toScreen(ix, iy);
+        const len = height * 0.034 * f.scale * sizeMul * (1 - 0.3 * deep);
+
+        ctx.save();
+        ctx.translate(px, py);
+        ctx.rotate(s.heading + Math.sin(f.wob * 0.6) * 0.16);
+        ctx.globalAlpha = Math.min(0.6, darkMul * (1 - 0.5 * deep) * (0.55 + 0.45 * f.scale));
+        ctx.drawImage(sprite, -len * 0.5, -len * 0.5, len, len);
+        ctx.restore();
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    return { resize, update, draw };
+  }
+
+  async function boot() {
+    const config = await window.wallpaperForge.getConfig();
+    if (!config || !config.wallpaper) return fail('No wallpaper assigned.');
+    const props = config.wallpaper.properties || {};
+    const num = (value, fallback) => (Number.isFinite(Number(value)) ? Number(value) : fallback);
+    const pair = (value, a, b) => {
+      const v = Array.isArray(value) ? value : [];
+      return [num(v[0], a), num(v[1], b)];
+    };
+
+    const gl = glCanvas.getContext('webgl2', {
+      antialias: false,
+      alpha: false,
+      powerPreference: 'low-power'
+    });
+    if (!gl) return fail('WebGL2 is not available on this machine.');
+
+    const image = await loadImage(props.plate || 'media/plate.png');
+    const program = buildProgram(gl);
+    gl.useProgram(program);
+
+    const buffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+    const aPos = gl.getAttribLocation(program, 'aPos');
+    gl.enableVertexAttribArray(aPos);
+    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+    const texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false); // uv.y = 0 is the top of the image
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    // Every mask is read through textureLod, so the mip chain is load bearing
+    // here, not just an anti-aliasing convenience.
+    gl.generateMipmap(gl.TEXTURE_2D);
+
+    const imageAspect = image.width / image.height;
+    const u = (name) => gl.getUniformLocation(program, name);
+    const uResolution = u('uResolution');
+    const uCursor = u('uCursor');
+    const uCanopyT = u('uCanopyT');
+    const uWaveT = u('uWaveT');
+    const uShoreT = u('uShoreT');
+
+    const gustAngle = (num(props.gustAngle, 72) * Math.PI) / 180;
+    const swellAngle = (num(props.swellAngle, 185) * Math.PI) / 180;
+    const gustLength = Math.max(0.05, num(props.gustLength, 0.95));
+    const swellLength = Math.max(0.02, num(props.swellLength, 0.30));
+    const foamLength = Math.max(0.02, num(props.foamLength, 0.155));
+    const swellK = (Math.PI * 2) / swellLength;
+    const foamK = (Math.PI * 2) / foamLength;
+
+    // Rates, kept on this side of the wire because every phase they drive is
+    // accumulated and wrapped here rather than in the shader.
+    const swayRate = num(props.swayRate, 1.6);
+    const gustSpeed = num(props.gustSpeed, 0.42);
+    const swellSpeed = num(props.swellSpeed, 0.038);
+    const runSpeed = num(props.runSpeed, 0.55);
+    const canopyEdge = pair(props.canopyEdge, 0.455, 0.535);
+    const greenGate = pair(props.greenGate, 0.025, 0.085);
+    const waterEdge = pair(props.waterEdge, 0.485, 0.535);
+    const depthLum = pair(props.depthLum, 0.22, 0.56);
+    const beachEdge = pair(props.beachEdge, 0.475, 0.68);
+    const beachLum = pair(props.beachLum, 0.40, 0.62);
+
+    gl.uniform1i(u('uImage'), 0);
+    gl.uniform1f(u('uImageAspect'), imageAspect);
+    gl.uniform1f(u('uMaskLod'), num(props.maskLod, 2));
+
+    gl.uniform1f(u('uSway'), num(props.sway, 0.0013));
+    gl.uniform1f(u('uCrownScale'), Math.max(0.02, num(props.crownScale, 0.26)));
+    gl.uniform1f(u('uCrownBoost'), num(props.crownBoost, 0.85));
+    gl.uniform1f(u('uSplay'), num(props.splay, 0.45));
+    gl.uniform2f(u('uGustDir'), Math.cos(gustAngle), Math.sin(gustAngle));
+    gl.uniform1f(u('uGustK'), (Math.PI * 2) / gustLength);
+    gl.uniform2f(u('uCanopyEdge'), canopyEdge[0], canopyEdge[1]);
+    gl.uniform2f(u('uGreenGate'), greenGate[0], greenGate[1]);
+
+    gl.uniform2f(u('uSwellDir'), Math.cos(swellAngle), Math.sin(swellAngle));
+    gl.uniform1f(u('uSwell'), num(props.swell, 0.0055));
+    gl.uniform1f(u('uSwellK'), swellK);
+    gl.uniform1f(u('uFoamK'), foamK);
+    gl.uniform1f(u('uFoamGain'), num(props.foamGain, 0.5));
+    gl.uniform1f(u('uShallowGain'), num(props.shallowGain, 0.8));
+    gl.uniform2f(u('uWaterEdge'), waterEdge[0], waterEdge[1]);
+    gl.uniform2f(u('uDepthLum'), depthLum[0], depthLum[1]);
+
+    gl.uniform1f(u('uFoamReach'), num(props.foamReach, 0.66));
+    gl.uniform1f(u('uRunFeather'), num(props.runFeather, 0.28));
+    gl.uniform1f(u('uRunStep'), num(props.runStep, 0.028));
+    gl.uniform1f(u('uLipGain'), num(props.lipGain, 0.7));
+    gl.uniform1f(u('uWashPush'), num(props.washPush, 0.0035));
+    gl.uniform2f(u('uBeachEdge'), beachEdge[0], beachEdge[1]);
+    gl.uniform2f(u('uBeachLum'), beachLum[0], beachLum[1]);
+
+    gl.uniform1f(u('uParallax'), num(props.parallax, 0.004));
+    gl.uniform1f(u('uVignette'), num(props.vignette, 0.06));
+    gl.uniform1f(u('uSaturate'), num(props.saturate, 1));
+    gl.uniform1f(u('uBrightness'), num(props.brightness, 1));
+
+    const overlay = createOverlay(fxCanvas, props, num, imageAspect);
+    const cursorEnabled = num(props.parallax, 0.004) !== 0;
+    const smoothCursor = { x: 0.5, y: 0.5 };
+
+    function resize() {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const w = Math.max(1, Math.round(window.innerWidth * dpr));
+      const h = Math.max(1, Math.round(window.innerHeight * dpr));
+      for (const canvas of [glCanvas, fxCanvas]) {
+        canvas.width = w;
+        canvas.height = h;
+      }
+      gl.viewport(0, 0, w, h);
+      gl.uniform2f(uResolution, w, h);
+      overlay.resize(w, h);
+    }
+    resize();
+    window.addEventListener('resize', resize);
+
+    let raf = null;
+    let last = performance.now();
+    let clock = 0;
+
+    // Reduce a phase to [0, 2 pi). Done here, in double precision, so the value
+    // the shader receives is small however long this has been running - see the
+    // note above the uniform block.
+    const TAU = Math.PI * 2;
+    const wrap = (x) => x - TAU * Math.floor(x / TAU);
+
+    function frame(now) {
+      raf = requestAnimationFrame(frame);
+      const dt = Math.min(0.05, (now - last) / 1000);
+      last = now;
+      clock += dt;
+
+      if (cursorEnabled) {
+        const { cursor } = window.wallpaperForge.frame();
+        // Ease toward the pointer so the parallax glides instead of snapping.
+        smoothCursor.x += (cursor.x - smoothCursor.x) * Math.min(1, dt * 2);
+        smoothCursor.y += (cursor.y - smoothCursor.y) * Math.min(1, dt * 2);
+      }
+
+      const t = clock;
+      // Each of these is the time half of one sine in the shader, split off from
+      // its spatial half so it can be wrapped on its own. The coefficients are
+      // the shader's constants folded in: a term written sin(gustRamp * 0.85 +
+      // uCanopyT.z) needs 0.85 of the gust rate subtracted from the sway rate.
+      gl.uniform4f(
+        uCanopyT,
+        wrap(t * gustSpeed),
+        wrap(t * gustSpeed * 0.37),
+        wrap(t * (swayRate - 0.85 * gustSpeed)),
+        wrap(t * (swayRate * 0.71 - 1.27 * gustSpeed))
+      );
+      gl.uniform4f(
+        uWaveT,
+        wrap(t * 0.07),
+        wrap(t * 0.05),
+        wrap(t * swellSpeed * swellK),
+        wrap(t * swellSpeed * swellK * 0.57)
+      );
+
+      // Two whole-frame quantities that depend on nothing but time: how big this
+      // set of waves is, and how far up the beach the swash has run. Evaluating
+      // them here rather than per pixel is both more accurate and cheaper.
+      const runPhase = t * runSpeed;
+      const sets = 0.72 + 0.17 * Math.sin(t * 0.091) + 0.11 * Math.sin(t * 0.0573 + 2.1);
+      const runCycle =
+        (0.5 + 0.5 * Math.sin(runPhase)) * (0.78 + 0.22 * Math.sin(runPhase * 0.41 + 1.7));
+      gl.uniform4f(uShoreT, wrap(t * swellSpeed * foamK), wrap(t * 0.21), sets, runCycle);
+
+      gl.uniform2f(uCursor, smoothCursor.x, smoothCursor.y);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+      overlay.update(dt);
+      overlay.draw();
+    }
+
+    function start() {
+      if (raf !== null) return;
+      last = performance.now();
+      raf = requestAnimationFrame(frame);
+    }
+    function stop() {
+      if (raf === null) return;
+      cancelAnimationFrame(raf);
+      raf = null;
+    }
+
+    // This runs 24/7 behind the desktop: a rAF loop left alive while paused
+    // burns CPU forever.
+    window.wallpaperForge.onPause((paused) => {
+      if (paused) stop();
+      else start();
+    });
+
+    if (!window.wallpaperForge.isPaused()) start();
+  }
+
+  boot().catch((err) => fail(String(err && err.message ? err.message : err)));
+</script>

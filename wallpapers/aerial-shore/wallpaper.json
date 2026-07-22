@@ -1,0 +1,75 @@
+{
+  "name": "Aerial Shore",
+  "type": "web",
+  "entry": "index.html",
+  "description": "Top-down tropical shoreline: palm crowns twisting in travelling gusts, a light swell washing leftward up the sand, fish shadows drifting through the turquoise shallows",
+  "preview": "media/plate.png",
+  "audio": false,
+  "cursor": true,
+  "properties": {
+    "plate": "media/plate.png",
+    "maskLod": 2,
+    "sway": 0.0013,
+    "swayRate": 1.6,
+    "crownScale": 0.26,
+    "crownBoost": 0.85,
+    "splay": 0.45,
+    "gustAngle": 72,
+    "gustLength": 0.95,
+    "gustSpeed": 0.42,
+    "canopyEdge": [
+      0.455,
+      0.535
+    ],
+    "greenGate": [
+      0.025,
+      0.085
+    ],
+    "swellAngle": 185,
+    "swell": 0.0055,
+    "swellLength": 0.3,
+    "swellSpeed": 0.038,
+    "shallowGain": 0.8,
+    "foamLength": 0.155,
+    "foamGain": 0.5,
+    "waterEdge": [
+      0.485,
+      0.535
+    ],
+    "depthLum": [
+      0.22,
+      0.56
+    ],
+    "foamReach": 0.66,
+    "runSpeed": 0.55,
+    "runFeather": 0.28,
+    "runStep": 0.028,
+    "lipGain": 0.7,
+    "washPush": 0.0035,
+    "beachEdge": [
+      0.475,
+      0.68
+    ],
+    "beachLum": [
+      0.4,
+      0.62
+    ],
+    "fish": 26,
+    "fishSchools": 5,
+    "fishSpeed": 1,
+    "fishSize": 1,
+    "fishDark": 0.34,
+    "fishBandX": [
+      0.655,
+      0.985
+    ],
+    "fishBandY": [
+      0.04,
+      0.96
+    ],
+    "parallax": 0.004,
+    "vignette": 0.06,
+    "saturate": 1,
+    "brightness": 1
+  }
+}

@@ -1,0 +1,979 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>WallpaperForge - konbini night</title>
+<style>
+  html,
+  body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #060a12;
+  }
+  #gl {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+  /* The snow falls across the whole frame, so this layer covers the screen and
+     sits above the shader. Its top is still set from script rather than fixed
+     at 0, because layout() owns the placement. */
+  #fx {
+    position: fixed;
+    left: 0;
+    display: block;
+    pointer-events: none;
+  }
+  #error {
+    position: fixed;
+    inset: 0;
+    display: none;
+    place-content: center;
+    font: 500 15px/1.6 system-ui, sans-serif;
+    color: #8b93a7;
+    text-align: center;
+    padding: 8vh 10vw;
+  }
+</style>
+<canvas id="gl"></canvas>
+<canvas id="fx"></canvas>
+<div id="error"></div>
+
+<script>
+  /**
+   * "Konbini night": a pixel-art store front at night, animated.
+   *
+   * The art is the whole point and it is fragile - every hard edge in it is
+   * deliberate. So nothing here resamples the plate. The shader only scales the
+   * colour a pixel already has, and the one place that does move pixels (the
+   * wet floor) shifts by WHOLE SOURCE TEXELS, which slides the reflection
+   * without ever blending two texels into a soft one.
+   *
+   *   - the shader owns the lights. Each vending machine's glass front breathes
+   *     on its own rhythm, the ceiling tubes hum and occasionally stutter, one
+   *     machine has a failing tube, and each machine's reflection in the wet
+   *     floor brightens and dims with the machine above it
+   *   - the overlay owns the snow, which is confined to the window band so it
+   *     reads as weather on the far side of the glass
+   *
+   * Nothing is hand-placed. At boot the plate is measured: the lit band, the
+   * seven machines, the ceiling tubes, the floor, and a mask of the night city
+   * are all found from the artwork's own luminance, saturation and colour (see
+   * analysePlate). Repaint the plate and the geometry follows it.
+   */
+
+  const errorBox = document.getElementById('error');
+  const glCanvas = document.getElementById('gl');
+  const fxCanvas = document.getElementById('fx');
+
+  function fail(message) {
+    errorBox.textContent = message;
+    errorBox.style.display = 'grid';
+  }
+
+  const TAU = Math.PI * 2;
+  const MAX_MACHINES = 8;
+  const MAX_TUBES = 4;
+
+  const num = (value, fallback) => (Number.isFinite(Number(value)) ? Number(value) : fallback);
+  const nums = (value, fallback) =>
+    Array.isArray(value) && value.length === fallback.length
+      ? value.map((v, i) => num(v, fallback[i]))
+      : fallback;
+  const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+  const lerp = (a, b, t) => a + (b - a) * t;
+
+  /** Seeded PRNG, so a given `seed` always produces the same store. */
+  function mulberry32(a) {
+    return function () {
+      a |= 0;
+      a = (a + 0x6d2b79f5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ===========================================================================
+  // Shader
+  // ===========================================================================
+
+  const VERT = `#version 300 es
+  in vec2 aPos;
+  out vec2 vUv;
+  void main() {
+    // Y is flipped so uv.y = 0 is the TOP of both screen and texture. The
+    // texture half of that comes from uploading with UNPACK_FLIP_Y off, which
+    // puts the image's first row at t = 0. Every band test downstream depends
+    // on this convention; without it the plate renders upside down.
+    vUv = vec2(aPos.x * 0.5 + 0.5, 0.5 - aPos.y * 0.5);
+    gl_Position = vec4(aPos, 0.0, 1.0);
+  }`;
+
+  const FRAG = `#version 300 es
+  precision highp float;
+
+  in vec2 vUv;
+  out vec4 fragColor;
+
+  uniform sampler2D uImage;
+  uniform vec2  uResolution;
+  uniform vec2  uPlate;          // plate size in texels
+  uniform float uImageAspect;
+  uniform float uTime;
+
+  uniform vec2  uGlassBand;      // image-space Y range of the lit machine fronts
+  uniform vec2  uFloorBand;      // image-space Y range of the wet floor
+  uniform vec2  uTubeBand;       // image-space Y range of the ceiling tubes
+
+  // xy = the x span in image UV, z = this frame's brightness level.
+  uniform vec4  uMachine[8];
+  uniform int   uMachineCount;
+  uniform vec4  uTube[4];
+  uniform int   uTubeCount;
+
+  uniform vec2  uGlassLevels;    // luminance ramp that isolates the lit glass
+  uniform vec2  uFloorLevels;    // ... the reflections in the floor
+  uniform vec2  uTubeLevels;     // ... the tubes themselves
+  uniform float uFloorGain;      // how much of a machine's swing reaches its reflection
+  uniform float uFloorWobble;    // reflection wobble, in WHOLE source texels
+  uniform float uFloorWobbleRate;
+  uniform float uBloom;          // extra lift toward white on the up-swing
+
+  /** Screen UV -> image UV for a cover (crop) fit. The plate is 16:10 like the
+      target display, so in practice this is the identity. */
+  vec2 coverUv(vec2 uv) {
+    float screenAspect = uResolution.x / uResolution.y;
+    vec2 scale = screenAspect > uImageAspect
+      ? vec2(1.0, uImageAspect / screenAspect)
+      : vec2(screenAspect / uImageAspect, 1.0);
+    return (uv - 0.5) * scale + 0.5;
+  }
+
+  // 1 inside a band, ramping over "edge" at both ends so nothing shows a seam.
+  float band(vec2 range, float y, float edge) {
+    return smoothstep(range.x - edge, range.x + edge, y)
+         * (1.0 - smoothstep(range.y - edge, range.y + edge, y));
+  }
+
+  void main() {
+    vec2 base = coverUv(vUv);
+
+    // -- the wet floor moves, everything else only changes brightness --------
+    //
+    // Water is the one thing in this picture that should not sit perfectly
+    // still, but the plate is pixel art: sampling it at a fractional offset
+    // blends two source texels and softens exactly the hard edges that make it
+    // read as pixel art. So the offset is rounded to whole texels. The
+    // reflection slides in visible steps, which is both correct for the medium
+    // and cheaper than any filtered alternative.
+    float floorRamp = band(uFloorBand, base.y, 0.008);
+
+    vec2 uv = base;
+    if (floorRamp > 0.002) {
+      float t = uTime * uFloorWobbleRate;
+      float wob = sin(base.x * 118.0 + t * 0.81)
+                + 0.62 * sin(base.x * 43.0 - t * 0.53 + 2.1)
+                + 0.34 * sin(base.x * 227.0 + t * 1.27 + 5.0);
+      uv.y += floor(wob * uFloorWobble * floorRamp + 0.5) / uPlate.y;
+    }
+
+    vec3 color = texture(uImage, clamp(uv, 0.0, 1.0)).rgb;
+    float l = dot(color, vec3(0.299, 0.587, 0.114));
+
+    // -- which machine owns this column, and how bright is it this frame? ----
+    //
+    // Accumulating a weighted average rather than picking one machine gives the
+    // borders a few pixels of blend. The bezels between machines are dark so it
+    // would not show there, but the reflections in the floor run together and a
+    // hard switch between two levels would draw a vertical seam across them.
+    float acc = 0.0;
+    float wsum = 0.0;
+    for (int i = 0; i < 8; i++) {
+      if (i >= uMachineCount) break;
+      vec4 m = uMachine[i];
+      float w = smoothstep(m.x - 0.004, m.x + 0.004, base.x)
+              * (1.0 - smoothstep(m.y - 0.004, m.y + 0.004, base.x));
+      acc += m.z * w;
+      wsum += w;
+    }
+    float level = wsum > 0.001 ? acc / wsum : 1.0;
+    float reach = min(1.0, wsum);
+
+    // The glass fronts, and their reflections one band below. Do not name the
+    // luminance gate "flat" - that is a reserved interpolation qualifier in
+    // GLSL ES 3. Avoid backticks in here too: this shader is a JS template
+    // literal and one anywhere inside, comments included, would end it early.
+    float glass = band(uGlassBand, base.y, 0.010)
+                * smoothstep(uGlassLevels.x, uGlassLevels.y, l);
+    float pool = floorRamp * smoothstep(uFloorLevels.x, uFloorLevels.y, l) * uFloorGain;
+
+    float amount = max(glass, pool) * reach;
+    color *= mix(1.0, level, amount);
+    // A light getting brighter also gets whiter at its core. Without this the
+    // swing reads as a gain knob rather than as a lamp.
+    color += max(0.0, level - 1.0) * amount * uBloom;
+
+    // -- ceiling tubes ------------------------------------------------------
+    float tacc = 0.0;
+    float tsum = 0.0;
+    for (int i = 0; i < 4; i++) {
+      if (i >= uTubeCount) break;
+      vec4 t = uTube[i];
+      float w = smoothstep(t.x - 0.004, t.x + 0.004, base.x)
+              * (1.0 - smoothstep(t.y - 0.004, t.y + 0.004, base.x));
+      tacc += t.z * w;
+      tsum += w;
+    }
+    if (tsum > 0.001) {
+      // The band ramp is wider than the tube so the glow spilling onto the
+      // ceiling and the frame dims with it; the luminance gate keeps the
+      // unlit ceiling out of it.
+      float amt = band(uTubeBand, base.y, 0.011) * min(1.0, tsum)
+                * smoothstep(uTubeLevels.x, uTubeLevels.y, l);
+      float tLevel = tacc / tsum;
+      color *= mix(1.0, tLevel, amt);
+      color += max(0.0, tLevel - 1.0) * amt * uBloom;
+    }
+
+    fragColor = vec4(color, 1.0);
+  }`;
+
+  function compile(gl, type, source) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      throw new Error(gl.getShaderInfoLog(shader) || 'shader compile failed');
+    }
+    return shader;
+  }
+
+  function buildProgram(gl) {
+    const program = gl.createProgram();
+    gl.attachShader(program, compile(gl, gl.VERTEX_SHADER, VERT));
+    gl.attachShader(program, compile(gl, gl.FRAGMENT_SHADER, FRAG));
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      throw new Error(gl.getProgramInfoLog(program) || 'program link failed');
+    }
+    return program;
+  }
+
+  function loadImage(src) {
+    return new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = () => reject(new Error('Could not load ' + src));
+      image.src = src;
+    });
+  }
+
+  // ===========================================================================
+  // Measuring the plate
+  // ===========================================================================
+
+  /** The contiguous run around the strongest row, out to `frac` of the peak. */
+  function peakBand(values, lo, hi, frac) {
+    let best = lo;
+    for (let i = lo; i < hi; i++) if (values[i] > values[best]) best = i;
+    const cut = values[best] * frac;
+    let a = best;
+    let b = best;
+    while (a > lo && values[a - 1] > cut) a--;
+    while (b < hi - 1 && values[b + 1] > cut) b++;
+    return [a, b];
+  }
+
+  /** Runs above `thresh`; gaps up to `maxGap` are bridged, short runs dropped. */
+  function findRuns(values, thresh, maxGap, minWidth) {
+    const out = [];
+    let start = -1;
+    for (let i = 0; i <= values.length; i++) {
+      const on = i < values.length && values[i] > thresh;
+      if (on && start < 0) start = i;
+      else if (!on && start >= 0) {
+        const last = out[out.length - 1];
+        if (last && start - last[1] <= maxGap) last[1] = i;
+        else out.push([start, i]);
+        start = -1;
+      }
+    }
+    return out.filter((r) => r[1] - r[0] >= minWidth);
+  }
+
+  /** Box blur along an array. Row profiles are noisy at single-row resolution,
+      and a band found by walking outward from a peak stops at the first dip. */
+  function smoothed(values, radius) {
+    const out = new Float32Array(values.length);
+    for (let i = 0; i < values.length; i++) {
+      let sum = 0;
+      let n = 0;
+      for (let k = -radius; k <= radius; k++) {
+        const j = i + k;
+        if (j >= 0 && j < values.length) {
+          sum += values[j];
+          n++;
+        }
+      }
+      out[i] = sum / n;
+    }
+    return out;
+  }
+
+  /**
+   * Everything this wallpaper needs to know about the artwork, read off the
+   * artwork. Nothing below is a coordinate someone typed in.
+   *
+   * The lit machine fronts are the brightest, most saturated thing in the
+   * picture, so a luminance-and-saturation count per row finds the band they
+   * live in, and the same count per column inside that band finds the machines:
+   * each one is a run of lit columns, and the dark bezels between them are the
+   * gaps. The ceiling tubes are the opposite - bright but nearly colourless -
+   * which separates them from the machines cleanly. The floor is simply the
+   * brightest band below everything else.
+   */
+  function analysePlate(image) {
+    const W = image.naturalWidth || image.width;
+    const H = image.naturalHeight || image.height;
+
+    const canvas = document.createElement('canvas');
+    canvas.width = W;
+    canvas.height = H;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(image, 0, 0);
+    const data = ctx.getImageData(0, 0, W, H).data;
+
+    const lumAt = (x, y) => {
+      const i = (y * W + x) * 4;
+      return (data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114) / 255;
+    };
+    const satAt = (x, y) => {
+      const i = (y * W + x) * 4;
+      const hi = Math.max(data[i], data[i + 1], data[i + 2]);
+      const lo = Math.min(data[i], data[i + 1], data[i + 2]);
+      return hi <= 1 ? 0 : (hi - lo) / hi;
+    };
+    const isLit = (x, y) => lumAt(x, y) > 0.34 && satAt(x, y) > 0.18;
+    const isPale = (x, y) => lumAt(x, y) > 0.30 && satAt(x, y) < 0.45;
+
+    // -- the band of lit machine fronts, and the machines inside it ----------
+    const rowLit = new Float32Array(H);
+    for (let y = 0; y < H; y++) {
+      let c = 0;
+      let n = 0;
+      for (let x = 0; x < W; x += 4) {
+        if (isLit(x, y)) c++;
+        n++;
+      }
+      rowLit[y] = c / n;
+    }
+    const [gTop, gBot] = peakBand(smoothed(rowLit, 6), Math.round(0.25 * H), Math.round(0.80 * H), 0.35);
+
+    const colLit = new Float32Array(W);
+    for (let x = 0; x < W; x++) {
+      let c = 0;
+      let n = 0;
+      for (let y = gTop; y <= gBot; y += 3) {
+        if (isLit(x, y)) c++;
+        n++;
+      }
+      colLit[x] = c / n;
+    }
+    const machines = findRuns(colLit, 0.05, 18, 110).slice(0, MAX_MACHINES);
+
+    // -- ceiling tubes: bright but colourless -------------------------------
+    const rowPale = new Float32Array(H);
+    for (let y = 0; y < H; y++) {
+      let c = 0;
+      let n = 0;
+      for (let x = 0; x < W; x += 4) {
+        if (isPale(x, y)) c++;
+        n++;
+      }
+      rowPale[y] = c / n;
+    }
+    const [tTop, tBot] = peakBand(smoothed(rowPale, 2), Math.round(0.08 * H), Math.round(0.26 * H), 0.3);
+
+    const colPale = new Float32Array(W);
+    for (let x = 0; x < W; x++) {
+      let c = 0;
+      let n = 0;
+      for (let y = tTop; y <= tBot; y++) {
+        if (isPale(x, y)) c++;
+        n++;
+      }
+      colPale[x] = c / n;
+    }
+    const tubes = findRuns(colPale, 0.15, 80, 80).slice(0, MAX_TUBES);
+
+    // -- the wet floor: the bright band below everything else ----------------
+    const rowLum = new Float32Array(H);
+    for (let y = 0; y < H; y++) {
+      let s = 0;
+      let n = 0;
+      for (let x = 0; x < W; x += 4) {
+        s += lumAt(x, y);
+        n++;
+      }
+      rowLum[y] = s / n;
+    }
+    const [fTop, fBot] = peakBand(smoothed(rowLum, 4), Math.round(0.75 * H), Math.round(0.97 * H), 0.45);
+
+    // -- the window: where snow is allowed to fall ---------------------------
+    //
+    // We are inside the store looking out, so snow may only appear over the
+    // night city. Colour alone cannot say where that is - almost everything in
+    // a night scene is blueish - so this is three tests at once: the band
+    // between the ceiling tubes and the tops of the machines, to the right of
+    // the interior shelving (which ends exactly where the first machine
+    // begins), and a colour that is dark and clearly blue rather than teal,
+    // warm or pale. Signage, the potted plant and the stocked shelves in front
+    // of the glass all fail the colour test, so snow passes behind them.
+    //
+    // Eroding by one cell afterwards throws away isolated cells - the dark gaps
+    // between products inside the store, which are the same colour as the sky
+    // but are emphatically not outside.
+    const MW = 512;
+    const MH = 320;
+    const winTop = (tBot + 6) / H;
+    const winBot = (gTop - 8) / H;
+    const winLeft = machines.length ? machines[0][0] / W : 0;
+
+    const raw = new Uint8Array(MW * MH);
+    for (let cy = 0; cy < MH; cy++) {
+      const yc = (cy + 0.5) / MH;
+      if (yc < winTop || yc > winBot) continue;
+      const y0 = Math.floor((cy * H) / MH);
+      const y1 = Math.floor(((cy + 1) * H) / MH);
+      for (let cx = 0; cx < MW; cx++) {
+        if ((cx + 0.5) / MW < winLeft) continue;
+        const x0 = Math.floor((cx * W) / MW);
+        const x1 = Math.floor(((cx + 1) * W) / MW);
+        let r = 0;
+        let g = 0;
+        let b = 0;
+        let n = 0;
+        for (let y = y0; y < y1; y += 2) {
+          for (let x = x0; x < x1; x += 2) {
+            const i = (y * W + x) * 4;
+            r += data[i];
+            g += data[i + 1];
+            b += data[i + 2];
+            n++;
+          }
+        }
+        if (!n) continue;
+        r /= n;
+        g /= n;
+        b /= n;
+        const l = (r * 0.299 + g * 0.587 + b * 0.114) / 255;
+        if (b - r > 14 && b - g > 12 && l > 0.03 && l < 0.3) raw[cy * MW + cx] = 1;
+      }
+    }
+    const mask = new Uint8Array(MW * MH);
+    for (let y = 1; y < MH - 1; y++) {
+      for (let x = 1; x < MW - 1; x++) {
+        const i = y * MW + x;
+        mask[i] = raw[i] && raw[i - 1] && raw[i + 1] && raw[i - MW] && raw[i + MW] ? 1 : 0;
+      }
+    }
+
+    return {
+      width: W,
+      height: H,
+      glassBand: [gTop / H, gBot / H],
+      floorBand: [fTop / H, fBot / H],
+      tubeBand: [tTop / H, tBot / H],
+      machines: machines.map(([a, b]) => [a / W, b / W]),
+      tubes: tubes.map(([a, b]) => [a / W, b / W]),
+      window: { mw: MW, mh: MH, mask, top: winTop, bottom: winBot, left: winLeft }
+    };
+  }
+
+  // ===========================================================================
+  // The lights
+  // ===========================================================================
+
+  /**
+   * An event that fires on an irregular timer and lasts a fixed while.
+   * Returns progress through the current event in 0..1, or -1 between them.
+   */
+  function makeSchedule(mean, jitter, length, rnd) {
+    const gap = () => Math.max(0.6, mean + (rnd() * 2 - 1) * jitter);
+    let next = rnd() * mean; // stagger the first one, so boot is not a chorus
+    let start = -1;
+    return (t) => {
+      if (start < 0 && t >= next) start = t;
+      if (start >= 0) {
+        const p = (t - start) / length;
+        if (p < 1) return p;
+        start = -1;
+        next = t + gap();
+      }
+      return -1;
+    };
+  }
+
+  /**
+   * Brightness for every machine front and every ceiling tube, per frame.
+   *
+   * Machines: two slow sines at rates that share no common period, each machine
+   * with its own pair, so the row shimmers instead of pulsing as one and never
+   * returns to a state you have already seen.
+   *
+   * Tubes: near-steady with a shallow mains ripple, plus a hard stutter every
+   * ten or twenty seconds. The stutter is a stepped waveform rather than a
+   * smooth dip, because that is what a starting fluorescent actually does.
+   *
+   * One machine, picked by the seed rather than named, has a failing tube: a
+   * permanent faint unsteadiness, and every several seconds a slow visible
+   * flutter that no other machine does.
+   */
+  function createLights(props, machineCount, tubeCount) {
+    const seed = Math.round(num(props.seed, 7));
+    const rnd = mulberry32(seed * 2654435761);
+
+    const rate = num(props.breatheRate, 1);
+    const depth = num(props.breatheDepth, 0.085);
+    const humRate = num(props.humRate, 6.7);
+    const humDepth = num(props.humDepth, 0.02);
+
+    const machines = [];
+    for (let i = 0; i < machineCount; i++) {
+      machines.push({
+        rateA: TAU * 0.105 * rate * (0.74 + 0.58 * rnd()),
+        rateB: TAU * 0.187 * rate * (0.8 + 0.62 * rnd()),
+        phaseA: rnd() * TAU,
+        phaseB: rnd() * TAU,
+        depth: depth * (0.72 + 0.56 * rnd())
+      });
+    }
+
+    const tubes = [];
+    for (let i = 0; i < tubeCount; i++) {
+      tubes.push({
+        phase: rnd() * TAU,
+        hum: humRate * (0.94 + 0.12 * rnd()),
+        stutter: makeSchedule(
+          num(props.stutterEvery, 15),
+          num(props.stutterJitter, 8),
+          Math.max(0.06, num(props.stutterLength, 0.34)),
+          rnd
+        )
+      });
+    }
+
+    // A starting tube goes dark, catches, drops out again, then holds. Stepped,
+    // not eased: the whole character of the thing is that it snaps.
+    const STUTTER = [0.22, 1.0, 0.38, 0.95, 0.18, 0.72, 1.0];
+
+    const requested = Math.round(num(props.failingMachine, -1));
+    const failing =
+      requested >= 0 && requested < machineCount
+        ? requested
+        : machineCount > 0
+          ? Math.floor(rnd() * machineCount)
+          : -1;
+    const failDepth = num(props.failDepth, 0.42);
+    const failRate = num(props.failRate, 1);
+    const failBurst = makeSchedule(
+      num(props.failBurstEvery, 7.5),
+      num(props.failBurstJitter, 4),
+      Math.max(0.2, num(props.failBurstLength, 1.35)),
+      rnd
+    );
+    const failRnd = mulberry32(seed * 40503 + 17);
+    // A sample-and-hold table: the failing tube reads back from this a few
+    // times a second, so its flicker is irregular but repeatable and costs
+    // nothing. Slow enough that you see each dip as a dip - run it much faster
+    // and a dying tube turns into video noise.
+    const FAIL_HOLD_HZ = 4.2;
+    const FAIL_STEPS = 64;
+    const failTable = new Float32Array(FAIL_STEPS);
+    for (let i = 0; i < FAIL_STEPS; i++) {
+      const r = failRnd();
+      failTable[i] = r < 0.34 ? 1 : r < 0.58 ? 0.45 : 0;
+    }
+
+    const machineLevels = new Float32Array(machineCount);
+    const tubeLevels = new Float32Array(tubeCount);
+
+    function step(t) {
+      for (let i = 0; i < machineCount; i++) {
+        const m = machines[i];
+        const breathe =
+          0.66 * Math.sin(t * m.rateA + m.phaseA) + 0.34 * Math.sin(t * m.rateB + m.phaseB);
+        let level = 1 + m.depth * breathe;
+
+        if (i === failing) {
+          // Never quite well: a slow shallow sag even between bursts.
+          level *= 1 - 0.035 * (0.5 + 0.5 * Math.sin(t * 2.9 * failRate));
+          const p = failBurst(t);
+          if (p >= 0) {
+            // Ramp in and out so the burst arrives and leaves rather than
+            // being switched on, which would read as a glitch in the video.
+            const env = Math.sin(Math.PI * clamp01(p));
+            const hold = failTable[Math.floor(t * FAIL_HOLD_HZ * failRate) % FAIL_STEPS];
+            level *= 1 - failDepth * env * (1 - hold);
+          }
+        }
+        machineLevels[i] = level;
+      }
+
+      for (let i = 0; i < tubeCount; i++) {
+        const tube = tubes[i];
+        let level = 1 + humDepth * Math.sin(t * TAU * tube.hum + tube.phase);
+        const p = tube.stutter(t);
+        if (p >= 0) {
+          level *= STUTTER[Math.min(STUTTER.length - 1, Math.floor(p * STUTTER.length))];
+        }
+        tubeLevels[i] = level;
+      }
+    }
+
+    return { step, machineLevels, tubeLevels };
+  }
+
+  // ===========================================================================
+  // Snow, falling across the front of the scene
+  // ===========================================================================
+
+  /**
+   * Snow drawn as hard-edged squares on whole art pixels. Anti-aliased dots
+   * would be the obvious thing and they are wrong here: a soft circle over
+   * pixel art looks like a smudge on the screen rather than part of the
+   * picture.
+   *
+   * The snow falls in front of everything, from the top of the frame down onto
+   * the pavement, where each flake breaks into a small puff and is respawned.
+   * Nothing settles anywhere else: the machines and the shopfront are vertical
+   * faces, and snow resting on them would read as dirt rather than weather.
+   */
+  function createSnow(canvas, plate, props) {
+    const ctx = canvas.getContext('2d');
+    const ART_W = plate.width;
+    const ART_H = plate.height;
+
+    const total = Math.max(0, Math.round(num(props.snowCount, 260)));
+    const speedScale = num(props.snowSpeed, 1);
+    const drift = num(props.snowDrift, 0.3);
+    const sway = num(props.snowSway, 8);
+    const swayRate = num(props.snowSwayRate, 1);
+    const color = nums(props.snowColor, [214, 232, 255]);
+
+    const sizes = nums(props.snowSizes, [3, 4, 6]);
+    const speeds = nums(props.snowSpeeds, [17, 29, 46]); // art pixels per second
+    const shares = nums(props.snowShares, [0.46, 0.34, 0.2]);
+    const alphas = nums(props.snowAlphas, [0.3, 0.5, 0.74]);
+
+    // Where a flake comes to rest. The pavement is a receding plane seen almost
+    // edge on, so depth reads as height: the small far flakes settle at the back
+    // of the slab and the big near ones at its front lip. Landing them all on
+    // one line would flatten the picture.
+    const landBand = nums(props.landBand, [0.806, 0.894]);
+    const landTopArt = clamp01(num(landBand[0], 0.806)) * ART_H;
+    const landBotArt = clamp01(num(landBand[1], 0.894)) * ART_H;
+
+    const LAND_LIFE = Math.max(0.05, num(props.landLife, 0.42));
+    const landings = [];
+
+    const rnd = mulberry32(Math.round(num(props.seed, 7)) * 22695477 + 3);
+
+    const lastLayer = Math.max(1, sizes.length - 1);
+    const layers = sizes.map((size, i) => {
+      const n = Math.max(0, Math.round(total * num(shares[i], 0.33)));
+      // 0 = furthest layer, 1 = nearest.
+      const depth = i / lastLayer;
+      return {
+        size: Math.max(1, Math.round(size)),
+        speed: num(speeds[i], 24) * speedScale,
+        alpha: clamp01(num(alphas[i], 0.5)),
+        rest: landTopArt + (landBotArt - landTopArt) * depth,
+        n,
+        x: new Float32Array(n),
+        y: new Float32Array(n),
+        land: new Float32Array(n),
+        phase: new Float32Array(n),
+        rate: new Float32Array(n),
+        amp: new Float32Array(n)
+      };
+    });
+
+    const spawn = (layer, i, fromTop) => {
+      layer.x[i] = -60 + rnd() * (ART_W + 120);
+      // Off the top of the frame, so a flake drifts into shot rather than
+      // popping into existence at the edge.
+      layer.y[i] = fromTop ? -40 - rnd() * ART_H * 0.35 : rnd() * layer.rest;
+      // A slab is deeper than it is tall on screen; jittering the rest height
+      // keeps the settle line from reading as a drawn rule.
+      layer.land[i] = layer.rest + (rnd() - 0.5) * (landBotArt - landTopArt) * 0.42;
+      layer.phase[i] = rnd() * TAU;
+      // Radians per second: a wobble every three to eight seconds. Faster and
+      // the flakes swirl like ash; slower and they simply fall in a line.
+      layer.rate[i] = (0.8 + rnd() * 1.4) * swayRate;
+      layer.amp[i] = sway * (0.4 + rnd() * 0.9);
+    };
+    for (const layer of layers) {
+      for (let i = 0; i < layer.n; i++) spawn(layer, i, false);
+    }
+
+    let width = 1;
+    let height = 1;
+    let unit = 1; // screen pixels per art pixel
+    let originX = 0;
+    let originY = 0; // art origin relative to the TOP OF THIS CANVAS, not the screen
+
+    /**
+     * Places the window band on screen and returns where this canvas belongs.
+     * Both halves live here so the cover fit is worked out once: the mapping
+     * needs the whole screen, while the canvas only covers the band, and doing
+     * those in two places is how they drift apart.
+     */
+    function layout(w, h) {
+      const screenAspect = w / h;
+      const imageAspect = ART_W / ART_H;
+      const sx = screenAspect > imageAspect ? 1 : screenAspect / imageAspect;
+      // Cover keeps the scale equal on both axes, so one unit is enough.
+      unit = w / sx / ART_W;
+      originX = w / 2 - (ART_W / 2) * unit;
+      originY = h / 2 - (ART_H / 2) * unit;
+
+      // Full screen: the snow falls in front of the machines now, so it is no
+      // longer confined to the window and the canvas has to cover everything.
+      width = w;
+      height = h;
+      return { top: 0, height: h };
+    }
+
+    function update(dt, time) {
+      for (const layer of layers) {
+        const dy = layer.speed * dt;
+        const dx = dy * drift;
+        for (let i = 0; i < layer.n; i++) {
+          layer.y[i] += dy;
+          layer.x[i] += dx;
+
+          if (layer.y[i] >= layer.land[i]) {
+            // Record the landing at the flake's swayed position, not its raw x,
+            // or the puff appears beside the flake that made it.
+            landings.push({
+              x: layer.x[i] + Math.sin(time * layer.rate[i] + layer.phase[i]) * layer.amp[i],
+              y: layer.land[i],
+              size: layer.size,
+              alpha: layer.alpha,
+              age: 0
+            });
+            spawn(layer, i, true);
+          } else if (layer.x[i] > ART_W + 60) {
+            layer.x[i] -= ART_W + 120;
+          }
+        }
+      }
+
+      for (let i = landings.length - 1; i >= 0; i--) {
+        landings[i].age += dt;
+        if (landings[i].age >= LAND_LIFE) landings.splice(i, 1);
+      }
+    }
+
+    const rgba = (a) => 'rgba(' + color[0] + ', ' + color[1] + ', ' + color[2] + ', ' + a + ')';
+
+    /**
+     * The puff a flake leaves when it hits the pavement: the flake flattens and
+     * two specks skip outward. Drawn on whole pixels like everything else - a
+     * soft radial burst would read as a smudge against this art.
+     */
+    function drawLanding(l) {
+      const t = l.age / LAND_LIFE;
+      const px = Math.max(1, Math.round(l.size * unit));
+      const x = Math.round(originX + l.x * unit);
+      const y = Math.round(originY + l.y * unit);
+
+      ctx.fillStyle = rgba((1 - t) * l.alpha * 0.85);
+      // Core: spreads sideways and thins as it settles.
+      const halfW = Math.max(1, Math.round(px * (0.5 + t * 1.1)));
+      const hgt = Math.max(1, Math.round(px * (1 - t * 0.6)));
+      ctx.fillRect(x - halfW, y, halfW * 2, hgt);
+
+      // Two specks, up and out, then gone.
+      if (t < 0.75) {
+        const out = Math.round(t * px * 2.6);
+        const up = Math.round(Math.sin(t * Math.PI) * px * 1.4);
+        ctx.fillStyle = rgba((1 - t / 0.75) * l.alpha * 0.7);
+        ctx.fillRect(x - out - px, y - up, px, px);
+        ctx.fillRect(x + out, y - up, px, px);
+      }
+    }
+
+    function draw(time) {
+      ctx.clearRect(0, 0, width, height);
+
+      for (const layer of layers) {
+        ctx.fillStyle = rgba(layer.alpha);
+        const px = Math.max(1, Math.round(layer.size * unit));
+        for (let i = 0; i < layer.n; i++) {
+          const ay = layer.y[i];
+          if (ay < -20) continue;
+          const ax = layer.x[i] + Math.sin(time * layer.rate[i] + layer.phase[i]) * layer.amp[i];
+
+          // Whole pixels on both axes. A fractional rect would be feathered by
+          // the rasteriser, which is the one thing this picture cannot take.
+          ctx.fillRect(Math.round(originX + ax * unit), Math.round(originY + ay * unit), px, px);
+        }
+      }
+
+      for (const l of landings) drawLanding(l);
+    }
+
+    return { layout, update, draw };
+  }
+
+  // ===========================================================================
+
+  async function boot() {
+    const config = await window.wallpaperForge.getConfig();
+    if (!config || !config.wallpaper) return fail('No wallpaper assigned.');
+    const properties = config.wallpaper.properties || {};
+
+    const gl = glCanvas.getContext('webgl2', {
+      antialias: false,
+      alpha: false,
+      powerPreference: 'low-power'
+    });
+    if (!gl) return fail('WebGL2 is not available on this machine.');
+
+    // Same origin as this page, so no CORS opt-in is needed for the upload.
+    const image = await loadImage('media/plate.png');
+    const plate = analysePlate(image);
+    if (!plate.machines.length) return fail('Could not find any lit panels in this plate.');
+
+    const program = buildProgram(gl);
+    gl.useProgram(program);
+
+    const buffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+    const aPos = gl.getAttribLocation(program, 'aPos');
+    gl.enableVertexAttribArray(aPos);
+    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+    const texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false); // uv.y = 0 is the top of the image
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+    const u = (name) => gl.getUniformLocation(program, name);
+
+    gl.uniform1i(u('uImage'), 0);
+    gl.uniform1f(u('uImageAspect'), plate.width / plate.height);
+    gl.uniform2f(u('uPlate'), plate.width, plate.height);
+    gl.uniform2f(u('uGlassBand'), plate.glassBand[0], plate.glassBand[1]);
+    gl.uniform2f(u('uFloorBand'), plate.floorBand[0], plate.floorBand[1]);
+    gl.uniform2f(u('uTubeBand'), plate.tubeBand[0], plate.tubeBand[1]);
+
+    const glassLevels = nums(properties.glassLevels, [0.22, 0.4]);
+    const floorLevels = nums(properties.floorLevels, [0.16, 0.34]);
+    const tubeLevels = nums(properties.tubeLevels, [0.24, 0.4]);
+    gl.uniform2f(u('uGlassLevels'), glassLevels[0], glassLevels[1]);
+    gl.uniform2f(u('uFloorLevels'), floorLevels[0], floorLevels[1]);
+    gl.uniform2f(u('uTubeLevels'), tubeLevels[0], tubeLevels[1]);
+    gl.uniform1f(u('uFloorGain'), num(properties.floorGain, 0.9));
+    gl.uniform1f(u('uFloorWobble'), num(properties.floorWobble, 1.8));
+    gl.uniform1f(u('uFloorWobbleRate'), num(properties.floorWobbleRate, 1));
+    gl.uniform1f(u('uBloom'), num(properties.bloom, 0.1));
+
+    // xy = span, z = level. Only z changes per frame, so the whole array goes
+    // up in one call and the spans never have to be re-sent.
+    const machineData = new Float32Array(MAX_MACHINES * 4);
+    plate.machines.forEach((span, i) => {
+      machineData[i * 4] = span[0];
+      machineData[i * 4 + 1] = span[1];
+      machineData[i * 4 + 2] = 1;
+    });
+    const tubeData = new Float32Array(MAX_TUBES * 4);
+    plate.tubes.forEach((span, i) => {
+      tubeData[i * 4] = span[0];
+      tubeData[i * 4 + 1] = span[1];
+      tubeData[i * 4 + 2] = 1;
+    });
+    gl.uniform1i(u('uMachineCount'), plate.machines.length);
+    gl.uniform1i(u('uTubeCount'), plate.tubes.length);
+    const uMachine = u('uMachine');
+    const uTube = u('uTube');
+
+    const lights = createLights(properties, plate.machines.length, plate.tubes.length);
+    const snow = createSnow(fxCanvas, plate, properties);
+    const uResolution = u('uResolution');
+    const uTime = u('uTime');
+
+    function resize() {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const w = Math.max(1, Math.round(window.innerWidth * dpr));
+      const h = Math.max(1, Math.round(window.innerHeight * dpr));
+
+      glCanvas.width = w;
+      glCanvas.height = h;
+      gl.viewport(0, 0, w, h);
+      gl.uniform2f(uResolution, w, h);
+
+      const rect = snow.layout(w, h);
+      fxCanvas.width = w;
+      fxCanvas.height = rect.height;
+      fxCanvas.style.top = rect.top / dpr + 'px';
+      fxCanvas.style.width = w / dpr + 'px';
+      fxCanvas.style.height = rect.height / dpr + 'px';
+    }
+    resize();
+    window.addEventListener('resize', resize);
+
+    let raf = null;
+    let last = performance.now();
+    let clock = 0;
+
+    function frame(now) {
+      raf = requestAnimationFrame(frame);
+      const dt = Math.min(0.05, (now - last) / 1000);
+      last = now;
+      clock += dt;
+
+      lights.step(clock);
+      for (let i = 0; i < lights.machineLevels.length; i++) {
+        machineData[i * 4 + 2] = lights.machineLevels[i];
+      }
+      for (let i = 0; i < lights.tubeLevels.length; i++) {
+        tubeData[i * 4 + 2] = lights.tubeLevels[i];
+      }
+      gl.uniform4fv(uMachine, machineData);
+      gl.uniform4fv(uTube, tubeData);
+      gl.uniform1f(uTime, clock);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+      snow.update(dt, clock);
+      snow.draw(clock);
+    }
+
+    function start() {
+      if (raf !== null) return;
+      last = performance.now();
+      raf = requestAnimationFrame(frame);
+    }
+    function stop() {
+      if (raf === null) return;
+      cancelAnimationFrame(raf);
+      raf = null;
+    }
+
+    // This runs 24/7 behind the desktop, so a live rAF while paused would burn
+    // CPU forever.
+    window.wallpaperForge.onPause((paused) => (paused ? stop() : start()));
+    if (!window.wallpaperForge.isPaused()) start();
+  }
+
+  boot().catch((err) => fail(String(err && err.message ? err.message : err)));
+</script>

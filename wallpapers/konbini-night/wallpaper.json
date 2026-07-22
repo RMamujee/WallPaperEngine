@@ -1,0 +1,76 @@
+{
+  "name": "Konbini Night",
+  "type": "web",
+  "entry": "index.html",
+  "description": "Pixel-art vending machines at night: humming fluorescent light, glowing product shelves, and snow falling past them onto the pavement",
+  "preview": "media/plate.png",
+  "audio": false,
+  "cursor": false,
+  "properties": {
+    "seed": 7,
+    "breatheRate": 1,
+    "breatheDepth": 0.085,
+    "bloom": 0.1,
+    "humRate": 6.7,
+    "humDepth": 0.02,
+    "stutterEvery": 15,
+    "stutterJitter": 8,
+    "stutterLength": 0.34,
+    "failingMachine": -1,
+    "failDepth": 0.42,
+    "failRate": 1,
+    "failBurstEvery": 7.5,
+    "failBurstJitter": 4,
+    "failBurstLength": 1.35,
+    "floorGain": 0.9,
+    "floorWobble": 1.8,
+    "floorWobbleRate": 1,
+    "snowCount": 750,
+    "snowSpeed": 1,
+    "snowDrift": 0.3,
+    "snowSway": 8,
+    "snowSwayRate": 1,
+    "landBand": [
+      0.806,
+      0.894
+    ],
+    "landLife": 0.42,
+    "snowSizes": [
+      4,
+      5,
+      7
+    ],
+    "snowSpeeds": [
+      110,
+      175,
+      260
+    ],
+    "snowShares": [
+      0.46,
+      0.34,
+      0.2
+    ],
+    "snowAlphas": [
+      0.3,
+      0.5,
+      0.74
+    ],
+    "snowColor": [
+      214,
+      232,
+      255
+    ],
+    "glassLevels": [
+      0.18,
+      0.4
+    ],
+    "floorLevels": [
+      0.16,
+      0.34
+    ],
+    "tubeLevels": [
+      0.24,
+      0.4
+    ]
+  }
+}

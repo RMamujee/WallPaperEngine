@@ -1,0 +1,604 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Red Cloud Shore</title>
+<style>
+  html,
+  body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #1d3a3f;
+  }
+  canvas {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+  #error {
+    position: fixed;
+    inset: 0;
+    display: none;
+    place-content: center;
+    font: 500 15px/1.6 system-ui, sans-serif;
+    color: #8b93a7;
+    text-align: center;
+    padding: 8vh 10vw;
+  }
+</style>
+<canvas id="gl"></canvas>
+<canvas id="fx"></canvas>
+<div id="error"></div>
+
+<script>
+  /**
+   * Red Cloud Shore: a woodblock seascape animated in place.
+   *
+   * Everything is a displacement of the printed plate, never a new object drawn
+   * over it, so the result still reads as ink on paper rather than as a 3D sea:
+   *
+   *   - the water is displaced along a travelling swell whose direction follows
+   *     the surf lines the printmaker actually painted. Those lines are not
+   *     horizontal and they are not parallel: measured off the plate with a
+   *     structure tensor, they run at about 100 degrees (down-screen, tilted
+   *     left) out in the open sea and bend round to about 147 degrees as they
+   *     reach the beach. uSeaAngle plus uBend reproduce that fan
+   *   - which pixels count as water is decided by the plate's own colour, the
+   *     same trick living.html uses for vegetation. Coral sand is red with very
+   *     little green; teal water and cream foam are not. See seaness()
+   *   - foam is modulated, not invented: the travelling phase brightens paint
+   *     that is already pale and dims paint that is already pale, so the painted
+   *     surf crests light up in advancing bands instead of stripes appearing in
+   *     flat teal
+   *   - on the sand a translucent wash runs up and retreats, thinning as it goes
+   *     so the leading edge softens the further out it reaches
+   *   - the salmon cumulus and the horizon cloud band drift on slow sines at
+   *     incommensurate rates, so there is no repeat period to notice. The small
+   *     red sun disc is masked out and never moves
+   *   - birds live on a 2D overlay, which stays crisp for free
+   *
+   * Every tuning number is a property in wallpaper.json.
+   */
+
+  const errorBox = document.getElementById('error');
+  const glCanvas = document.getElementById('gl');
+  const fxCanvas = document.getElementById('fx');
+
+  function fail(message) {
+    errorBox.textContent = message;
+    errorBox.style.display = 'grid';
+  }
+
+  const VERT = `#version 300 es
+  in vec2 aPos;
+  out vec2 vUv;
+  void main() {
+    // Y is flipped so uv.y = 0 is the TOP of both the screen and the texture.
+    // The texture half of that comes from uploading with UNPACK_FLIP_Y off,
+    // which puts the image's first row at t = 0. Every horizon test below
+    // depends on this convention.
+    vUv = vec2(aPos.x * 0.5 + 0.5, 0.5 - aPos.y * 0.5);
+    gl_Position = vec4(aPos, 0.0, 1.0);
+  }`;
+
+  const FRAG = `#version 300 es
+  precision highp float;
+
+  // Steps taken when measuring how far a sand pixel is from the water. Five is
+  // enough for the run-up to have somewhere to go and cheap enough to run over
+  // the beach every frame.
+  #define MARCH 5
+
+  in vec2 vUv;
+  out vec4 fragColor;
+
+  uniform sampler2D uImage;
+  uniform vec2  uResolution;
+  uniform float uImageAspect;
+  uniform float uTime;
+
+  uniform float uHorizon;      // image-space Y of the sky/sea join
+  uniform vec2  uShoreRef;     // image UV of a point on the waterline
+  uniform vec2  uSeaDir;       // unit travel direction far offshore
+  uniform float uBend;         // how hard the swell wraps into the bay
+  uniform float uBendEdge;     // along-shore coordinate where the bend dies out
+  uniform float uShoreTheta;   // phase value at the dry-sand edge
+
+  uniform float uSwell;
+  uniform float uWaveSpeed;
+  uniform float uWaveK;        // 2 pi / swell wavelength
+  uniform float uFoamK;        // 2 pi / foam-band wavelength
+  uniform float uShallowGain;
+  uniform float uFoamGain;
+
+  uniform float uFoamReach;    // 0..1 of the marched range, see MARCH below
+  uniform float uRunFeather;
+  uniform float uRunSpeed;
+  uniform float uRunStep;
+  uniform float uLipGain;
+
+  uniform float uCloudDrift;
+  uniform float uFarCloudScale;
+  uniform float uCloudDeform;
+  uniform vec2  uSkyFade;      // image Y where the sky band fades out, start/end
+  uniform vec2  uLandLine;     // headland half-plane: y > x + y * iuv.x is land
+  uniform vec2  uSunPos;
+  uniform float uSunGuard;
+
+  uniform float uPaper;
+  uniform float uVignette;
+  uniform float uSaturate;
+  uniform float uBrightness;
+  uniform float uParallax;
+  uniform vec2  uCursor;
+
+  /** Screen UV -> image UV for a cover (crop) fit. */
+  vec2 coverUv(vec2 uv) {
+    float screenAspect = uResolution.x / uResolution.y;
+    vec2 scale = screenAspect > uImageAspect
+      ? vec2(1.0, uImageAspect / screenAspect)
+      : vec2(screenAspect / uImageAspect, 1.0);
+    return (uv - 0.5) * scale + 0.5;
+  }
+
+  /**
+   * How much this pixel behaves as water.
+   *
+   * On this plate the sand is the only thing that is red with almost no green:
+   * dry sand runs about (192, 52, 35), the cream surf wash about (240, 143, 113)
+   * and open water about (24, 82, 83). r - 2.2g separates all three cleanly and
+   * costs one multiply-add, where a hue conversion would not.
+   */
+  float sandness(vec3 c) {
+    return smoothstep(-0.04, 0.16, c.r - 2.2 * c.g);
+  }
+
+  /** Smooth max(0, x). Used so the swell's bend has no crease in it. */
+  float softFloor(float x) {
+    return 0.5 * (x + sqrt(x * x + 0.05));
+  }
+  float softFloorSlope(float x) {
+    return 0.5 * (1.0 + x / sqrt(x * x + 0.05));
+  }
+
+  float hash21(vec2 p) {
+    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+  }
+
+  void main() {
+    vec2 parallax = (uCursor - 0.5) * uParallax;
+    vec2 iuv = coverUv(vUv) + parallax * vec2(1.0, 0.6);
+
+    // Aspect-true space: angles measured off the plate in pixels only mean
+    // anything once x has been stretched by the image aspect.
+    vec2 p = vec2(iuv.x * uImageAspect, iuv.y);
+    vec2 origin = vec2(uShoreRef.x * uImageAspect, uShoreRef.y);
+    vec2 alongShore = vec2(uSeaDir.y, -uSeaDir.x);
+
+    // Swell phase field. The first term is a plain ramp along the offshore
+    // travel direction; the second adds a ramp that only switches on to the
+    // shoreward side of uBendEdge, which rotates the gradient from 100 degrees
+    // out at sea to about 147 degrees at the beach without a seam between them.
+    float along = dot(p - origin, alongShore);
+    float bendArg = uBendEdge - along;
+    float theta = dot(p - origin, uSeaDir) + uBend * softFloor(bendArg);
+    vec2 grad = uSeaDir - uBend * softFloorSlope(bendArg) * alongShore;
+    float gradLen = length(grad);
+    vec2 travel = grad / gradLen;
+
+    // --- clouds -----------------------------------------------------------
+    // Deliberately NOT gated on colour. Masking the offset by "is this pixel
+    // salmon" cuts the displacement off along the cloud silhouette, and a
+    // discontinuity in a sampling offset is a tear: it draws a bright hairline
+    // right around every cloud. Sliding the whole sky instead is seamless, and
+    // the flat grey sky shows no motion of its own anyway. That leaves only
+    // two things in the band that must be held still, and both are shapes
+    // rather than colours, so both can be excluded smoothly.
+    float skyBand = 1.0 - smoothstep(uSkyFade.x, uSkyFade.y, iuv.y);
+    // Wide on purpose. The cumulus sits directly on the headland ridge for much
+    // of its length, so wherever this guard turns off it shears whatever cloud
+    // is there; spreading that over 140-odd pixels turns a visible skew into
+    // the slight billowing the cumulus is supposed to have anyway.
+    float landGuard = 1.0 - smoothstep(-0.09, 0.01, iuv.y - (uLandLine.x + uLandLine.y * iuv.x));
+    vec2 sunDelta = (iuv - uSunPos) * vec2(uImageAspect, 1.0);
+    float sunGuard = smoothstep(uSunGuard * 0.45, uSunGuard, length(sunDelta));
+    float sky = skyBand * landGuard * sunGuard;
+
+    float bandHigh = 1.0 - smoothstep(0.38, 0.46, iuv.y);
+    float bandLow = smoothstep(0.38, 0.46, iuv.y);
+
+    float driftHigh = (sin(uTime * 0.052) * 0.62 + sin(uTime * 0.0311 + 1.9) * 0.38) * uCloudDrift;
+    float driftLow = (sin(uTime * 0.0374 + 0.7) * 0.65 + sin(uTime * 0.0231 + 2.6) * 0.35)
+                   * uCloudDrift * uFarCloudScale;
+
+    vec2 cloudOff = vec2(driftHigh * bandHigh + driftLow * bandLow, 0.0);
+    // A touch of low-frequency warp so the cumulus billows instead of sliding
+    // rigidly. Kept far below the drift, or the outline starts to boil.
+    cloudOff += vec2(
+      sin(iuv.y * 8.3 + uTime * 0.081),
+      sin(iuv.x * 6.1 - uTime * 0.063) * 0.55
+    ) * uCloudDeform * bandHigh;
+    cloudOff *= sky;
+
+    // --- water ------------------------------------------------------------
+    // The plate as it stands after the sky has drifted. Below the horizon that
+    // drift is zero, so this doubles as the undisplaced sample whose own colour
+    // decides whether a pixel is allowed to move at all. Do not call it "flat" -
+    // that is a reserved interpolation qualifier in GLSL ES 3. Avoid backticks
+    // in here too: this shader is a JS template literal and one would end the
+    // string early.
+    vec2 base = iuv + cloudOff;
+    vec3 still = texture(uImage, clamp(base, 0.0, 1.0)).rgb;
+    float sand = sandness(still);
+
+    float belowHorizon = smoothstep(uHorizon - 0.004, uHorizon + 0.02, iuv.y);
+    // The headland is dark green, so it fails the sand test and colour alone
+    // would let it ripple. It sits well past the waterline in phase, which is
+    // the cheapest way to exclude it; the depth taper below finishes the job,
+    // since the headland bottoms out around y = 0.66 and the taper is still
+    // near zero there.
+    float seaSide = 1.0 - smoothstep(uShoreTheta - 0.02, uShoreTheta + 0.20, theta);
+    float water = (1.0 - sand) * belowHorizon * seaSide;
+
+    // Distant water barely moves on screen, and the plate paints no surf above
+    // y = 0.64 anyway, so taper the whole effect in over the near sea rather
+    // than letting the flat far water churn.
+    float depth = smoothstep(uHorizon + 0.10, uHorizon + 0.36, iuv.y);
+    float shallow = 1.0 + uShallowGain * smoothstep(uShoreTheta - 0.60, uShoreTheta - 0.05, theta);
+
+    // Sets: two slow sines at an irrational-ish ratio, so successive swells
+    // differ in size and the sequence never visibly comes back round.
+    float sets = 0.74 + 0.16 * sin(uTime * 0.113) + 0.10 * sin(uTime * 0.0718 + 2.1);
+
+    // One shared travelled coordinate, so the swell and the foam bands run at
+    // the same speed even though they have different wavelengths.
+    float travelled = theta - uTime * uWaveSpeed / uWaveK;
+    float phase = travelled * uWaveK;
+    // The companion term is a LONGER wave, not a shorter one. A harmonic above
+    // the fundamental multiplies the steepness by its own ratio, and steepness
+    // is the whole budget here: once amplitude times wavenumber passes 1 the
+    // displacement folds the texture back over itself and the painted surf
+    // shreds into scallops.
+    float swell = sin(phase) + 0.22 * sin(phase * 0.63 + 2.2);
+
+    // Dividing by gradLen holds that steepness constant. The bend packs the
+    // phase contours together near the beach, which shortens the wavelength
+    // exactly where shallow is also raising the amplitude - the two together
+    // are what tipped this over the folding threshold.
+    float amp = uSwell * depth * shallow * sets / gradLen;
+    vec2 waterOff = travel * (swell * amp);
+    waterOff.x /= uImageAspect;
+
+    // The water mask IS a colour mask and so would tear exactly the way the
+    // clouds did. Cross fade between the still plate and the displaced one
+    // instead of switching the offset on and off: worst case that ghosts by the
+    // swell amplitude along the waterline, where the paint is lace anyway.
+    vec3 moved = texture(uImage, clamp(base + waterOff, 0.0, 1.0)).rgb;
+    vec3 color = mix(still, moved, water);
+
+    // Foam, modulated rather than drawn. Gating on paint that is already pale
+    // means the advancing band lights up the printed crests and leaves the flat
+    // teal between them alone, which is what keeps this looking like a print.
+    float painted = smoothstep(0.40, 0.70, dot(color, vec3(0.299, 0.587, 0.114)));
+    float foamField = painted * water * depth * uFoamGain;
+    // Its own wavelength, matched to the spacing of the printed surf lines, so
+    // the band lights one crest at a time rather than a whole group.
+    float foamPhase = travelled * uFoamK;
+    float crest = smoothstep(0.05, 0.90, sin(foamPhase));
+    float trough = smoothstep(0.05, 0.90, -sin(foamPhase));
+    color = mix(color, min(color * 1.20 + vec3(0.10, 0.075, 0.06), vec3(1.0)), crest * foamField);
+    color *= 1.0 - 0.05 * trough * foamField;
+
+    // Run-up. How far inland a sand pixel is gets measured off the plate rather
+    // than assumed: march back along the travel direction and count how many
+    // steps are still sand. A fixed phase threshold will not do, because the
+    // painted sand edge wanders by more than half a wavelength between the
+    // headland and the bottom of the frame, which leaves the wash floating in
+    // the middle of the beach at one end of the shore.
+    float toWater = 1.0;
+    if (sand > 0.01 && belowHorizon > 0.5) {
+      vec2 back = vec2(travel.x / uImageAspect, travel.y) * uRunStep;
+      float marched = 0.0;
+      for (int i = 1; i <= MARCH; i++) {
+        marched += sandness(textureLod(uImage, clamp(iuv - back * float(i), 0.0, 1.0), 0.0).rgb);
+      }
+      toWater = marched / float(MARCH);
+    }
+
+    // The front runs out and back on its own slower cycle, so it drifts in and
+    // out of step with the swell the way a real beach does. The cusp term lets
+    // it lead and lag along the shore, because a swash edge is never one
+    // straight line, and it breaks up the shelves that five discrete march
+    // steps would otherwise leave in the wet sand.
+    float runPhase = uTime * uRunSpeed;
+    float cusp = 0.86 + 0.14 * sin(along * 11.0 + uTime * 0.19);
+    float front = uFoamReach * (0.5 + 0.5 * sin(runPhase))
+                * (0.78 + 0.22 * sin(runPhase * 0.41 + 1.7)) * cusp;
+    float reached = 1.0 - smoothstep(front - uRunFeather, front, toWater);
+    // Thinner the further it runs, so the edge dries out instead of stopping dead.
+    float thinning = 1.0 - 0.55 * smoothstep(0.0, 1.0, toWater);
+    float wet = reached * thinning * sand * belowHorizon;
+
+    color = mix(color, color * vec3(0.80, 0.74, 0.72), wet * 0.5);
+    float lip = 1.0 - smoothstep(0.0, uRunFeather * 0.8, abs(toWater - front));
+    color = mix(color, vec3(0.95, 0.71, 0.60), lip * thinning * sand * belowHorizon * uLipGain * 0.45);
+
+    // Paper grain, keyed to the screen and not to the plate, so the sheet stays
+    // still while the ink on it moves.
+    float grain = hash21(floor(gl_FragCoord.xy * 0.5)) - 0.5;
+    color *= 1.0 + grain * uPaper;
+
+    color *= uBrightness;
+    color = mix(vec3(dot(color, vec3(0.299, 0.587, 0.114))), color, uSaturate);
+
+    float vig = 1.0 - uVignette * pow(length((vUv - 0.5) * vec2(1.05, 1.0)) * 1.32, 2.4);
+    color *= clamp(vig, 0.0, 1.0);
+
+    fragColor = vec4(color, 1.0);
+  }`;
+
+  function compile(gl, type, source) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      throw new Error(gl.getShaderInfoLog(shader) || 'shader compile failed');
+    }
+    return shader;
+  }
+
+  function buildProgram(gl) {
+    const program = gl.createProgram();
+    gl.attachShader(program, compile(gl, gl.VERTEX_SHADER, VERT));
+    gl.attachShader(program, compile(gl, gl.FRAGMENT_SHADER, FRAG));
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      throw new Error(gl.getProgramInfoLog(program) || 'program link failed');
+    }
+    return program;
+  }
+
+  function loadImage(src) {
+    return new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = () => reject(new Error(`Could not load ${src}`));
+      image.src = src;
+    });
+  }
+
+  /** Distant birds over the sea, drawn on a 2D overlay above the shader. */
+  function createOverlay(canvas, props, num, landLine) {
+    const ctx = canvas.getContext('2d');
+    const count = Math.max(0, Math.round(num(props.birds, 6)));
+    const band = Array.isArray(props.birdBand) ? props.birdBand : [0.33, 0.60];
+    const speed = num(props.birdSpeed, 0.7);
+    const size = num(props.birdSize, 1.5);
+
+    let width = 1;
+    let height = 1;
+    const birds = [];
+
+    const spawn = (offscreen) => {
+      // Small birds read as further away, so they also cross more slowly.
+      const scale = 0.3 + Math.random() * 0.5;
+      const dir = Math.random() < 0.5 ? 1 : -1;
+      return {
+        dir,
+        x: offscreen ? (dir > 0 ? -0.08 : 1.08) : Math.random(),
+        y: band[0] + Math.random() * Math.max(0.01, band[1] - band[0]),
+        scale,
+        speed: (0.006 + scale * 0.018) * speed,
+        flap: Math.random() * Math.PI * 2,
+        flapRate: 4.5 + Math.random() * 3,
+        bob: Math.random() * Math.PI * 2
+      };
+    };
+
+    for (let i = 0; i < count; i++) birds.push(spawn(false));
+
+    function resize(w, h) {
+      width = w;
+      height = h;
+    }
+
+    function drawBird(bird) {
+      const s = bird.scale * height * 0.012 * size;
+      const x = bird.x * width;
+      // Held above the headland silhouette - the same half-plane the shader
+      // uses to decide what is land - so a bird crossing to the left climbs
+      // along the ridge instead of gliding through it.
+      const ceiling = landLine[0] + landLine[1] * bird.x - 0.03;
+      const y = (Math.min(bird.y, ceiling) + Math.sin(bird.bob) * 0.008) * height;
+      // Wings sweep from a shallow V to a deep one: the classic two-arc gull.
+      const lift = Math.sin(bird.flap);
+      const span = s * (0.85 + 0.25 * lift);
+      const drop = s * (0.55 - 0.55 * lift);
+
+      ctx.beginPath();
+      ctx.moveTo(x - span, y + drop);
+      ctx.quadraticCurveTo(x - span * 0.42, y - s * 0.42, x, y);
+      ctx.quadraticCurveTo(x + span * 0.42, y - s * 0.42, x + span, y + drop);
+      ctx.lineWidth = Math.max(1, s * 0.19);
+      ctx.strokeStyle = `rgba(20, 28, 32, ${0.36 + bird.scale * 0.5})`;
+      ctx.lineCap = 'round';
+      ctx.stroke();
+    }
+
+    function update(dt) {
+      for (const bird of birds) {
+        bird.x += bird.dir * bird.speed * dt;
+        bird.flap += bird.flapRate * dt;
+        bird.bob += dt * 0.7;
+        if (bird.x < -0.12 || bird.x > 1.12) Object.assign(bird, spawn(true));
+      }
+    }
+
+    function draw() {
+      ctx.clearRect(0, 0, width, height);
+      for (const bird of birds) drawBird(bird);
+    }
+
+    return { resize, update, draw };
+  }
+
+  async function boot() {
+    const config = await window.wallpaperForge.getConfig();
+    if (!config || !config.wallpaper) return fail('No wallpaper assigned.');
+    const props = config.wallpaper.properties || {};
+    const num = (value, fallback) => (Number.isFinite(Number(value)) ? Number(value) : fallback);
+
+    const gl = glCanvas.getContext('webgl2', {
+      antialias: false,
+      alpha: false,
+      powerPreference: 'low-power'
+    });
+    if (!gl) return fail('WebGL2 is not available on this machine.');
+
+    const image = await loadImage(props.plate || 'media/plate.png');
+    const program = buildProgram(gl);
+    gl.useProgram(program);
+
+    const buffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+    const aPos = gl.getAttribLocation(program, 'aPos');
+    gl.enableVertexAttribArray(aPos);
+    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+    const texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false); // uv.y = 0 is the top of the image
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    // On a 2560x1600 display this plate is 1:1 and never minified, but the
+    // preview tool and any smaller monitor would alias the paper grain without
+    // a mip chain.
+    gl.generateMipmap(gl.TEXTURE_2D);
+
+    const u = (name) => gl.getUniformLocation(program, name);
+    const uTime = u('uTime');
+    const uResolution = u('uResolution');
+    const uCursor = u('uCursor');
+
+    // Measured off the plate: the surf lines run at this angle out in the open
+    // sea, where 90 would be straight down the screen and larger tilts left.
+    const seaAngle = (num(props.seaAngle, 100) * Math.PI) / 180;
+    const shoreRef = Array.isArray(props.shoreRef) ? props.shoreRef : [0.40, 0.93];
+    const sun = Array.isArray(props.sunPos) ? props.sunPos : [0.6963, 0.1303];
+    const waveLength = Math.max(0.02, num(props.waveLength, 0.2));
+    const foamLength = Math.max(0.02, num(props.foamLength, 0.118));
+    const skyFade = Array.isArray(props.skyFade) ? props.skyFade : [0.47, 0.5];
+    // Measured off the plate: the headland ridge runs y = 0.318 + 0.452x.
+    const landLine = Array.isArray(props.landLine) ? props.landLine : [0.318, 0.452];
+
+    gl.uniform1i(u('uImage'), 0);
+    gl.uniform1f(u('uImageAspect'), image.width / image.height);
+    gl.uniform1f(u('uHorizon'), num(props.horizon, 0.524));
+    gl.uniform2f(u('uShoreRef'), num(shoreRef[0], 0.40), num(shoreRef[1], 0.93));
+    gl.uniform2f(u('uSeaDir'), Math.cos(seaAngle), Math.sin(seaAngle));
+    gl.uniform1f(u('uBend'), num(props.bend, 1.07));
+    gl.uniform1f(u('uBendEdge'), num(props.bendEdge, 0.42));
+    gl.uniform1f(u('uShoreTheta'), num(props.shoreTheta, 0.56));
+
+    gl.uniform1f(u('uSwell'), num(props.swell, 0.007));
+    gl.uniform1f(u('uWaveSpeed'), num(props.waveSpeed, 0.72));
+    gl.uniform1f(u('uWaveK'), (Math.PI * 2) / waveLength);
+    gl.uniform1f(u('uFoamK'), (Math.PI * 2) / foamLength);
+    gl.uniform1f(u('uShallowGain'), num(props.shallowGain, 0.4));
+    gl.uniform1f(u('uFoamGain'), num(props.foamGain, 0.55));
+
+    gl.uniform1f(u('uFoamReach'), num(props.foamReach, 0.72));
+    gl.uniform1f(u('uRunFeather'), num(props.runFeather, 0.3));
+    gl.uniform1f(u('uRunSpeed'), num(props.runSpeed, 0.62));
+    gl.uniform1f(u('uRunStep'), num(props.runStep, 0.02));
+    gl.uniform1f(u('uLipGain'), num(props.lipGain, 0.7));
+
+    gl.uniform1f(u('uCloudDrift'), num(props.cloudDrift, 0.011));
+    gl.uniform1f(u('uFarCloudScale'), num(props.farCloudScale, 0.3));
+    gl.uniform1f(u('uCloudDeform'), num(props.cloudDeform, 0.0016));
+    gl.uniform2f(u('uSkyFade'), num(skyFade[0], 0.47), num(skyFade[1], 0.5));
+    gl.uniform2f(u('uLandLine'), num(landLine[0], 0.318), num(landLine[1], 0.452));
+    gl.uniform2f(u('uSunPos'), num(sun[0], 0.6963), num(sun[1], 0.1303));
+    gl.uniform1f(u('uSunGuard'), num(props.sunGuard, 0.05));
+
+    gl.uniform1f(u('uPaper'), num(props.paper, 0.01));
+    gl.uniform1f(u('uVignette'), num(props.vignette, 0));
+    gl.uniform1f(u('uSaturate'), num(props.saturate, 1));
+    gl.uniform1f(u('uBrightness'), num(props.brightness, 1));
+    gl.uniform1f(u('uParallax'), num(props.parallax, 0.006));
+
+    const overlay = createOverlay(fxCanvas, props, num, [
+      num(landLine[0], 0.318),
+      num(landLine[1], 0.452)
+    ]);
+    const cursorEnabled = num(props.parallax, 0.006) !== 0;
+    const smoothCursor = { x: 0.5, y: 0.5 };
+
+    function resize() {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const w = Math.max(1, Math.round(window.innerWidth * dpr));
+      const h = Math.max(1, Math.round(window.innerHeight * dpr));
+      for (const canvas of [glCanvas, fxCanvas]) {
+        canvas.width = w;
+        canvas.height = h;
+      }
+      gl.viewport(0, 0, w, h);
+      gl.uniform2f(uResolution, w, h);
+      overlay.resize(w, h);
+    }
+    resize();
+    window.addEventListener('resize', resize);
+
+    let raf = null;
+    let last = performance.now();
+    let clock = 0;
+
+    function frame(now) {
+      raf = requestAnimationFrame(frame);
+      const dt = Math.min(0.05, (now - last) / 1000);
+      last = now;
+      clock += dt;
+
+      if (cursorEnabled) {
+        const { cursor } = window.wallpaperForge.frame();
+        // Ease toward the pointer so the parallax glides instead of snapping.
+        smoothCursor.x += (cursor.x - smoothCursor.x) * Math.min(1, dt * 2);
+        smoothCursor.y += (cursor.y - smoothCursor.y) * Math.min(1, dt * 2);
+      }
+
+      gl.uniform1f(uTime, clock);
+      gl.uniform2f(uCursor, smoothCursor.x, smoothCursor.y);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+      overlay.update(dt);
+      overlay.draw();
+    }
+
+    function start() {
+      if (raf !== null) return;
+      last = performance.now();
+      raf = requestAnimationFrame(frame);
+    }
+    function stop() {
+      if (raf === null) return;
+      cancelAnimationFrame(raf);
+      raf = null;
+    }
+
+    // This runs 24/7 behind the desktop: a rAF loop left alive while paused
+    // burns CPU forever.
+    window.wallpaperForge.onPause((paused) => {
+      if (paused) stop();
+      else start();
+    });
+
+    if (!window.wallpaperForge.isPaused()) start();
+  }
+
+  boot().catch((err) => fail(String(err && err.message ? err.message : err)));
+</script>

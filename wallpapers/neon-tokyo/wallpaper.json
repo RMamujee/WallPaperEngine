@@ -1,0 +1,69 @@
+{
+  "name": "Neon Tokyo",
+  "type": "web",
+  "entry": "index.html",
+  "description": "Golden-hour Tokyo. Cloud bands drift across the sunset while the volcano and every rooftop hold perfectly still; lit windows breathe and a few switch off and back on, and the signage shimmers.",
+  "preview": "media/plate.png",
+  "audio": false,
+  "cursor": true,
+  "properties": {
+    "cloudDrift": 0.019,
+    "cloudSpeed": 0.85,
+    "cloudLayer": 0.22,
+    "skyMargin": 0.055,
+
+    "skyRatio": 0.7,
+    "skyRefWindow": 0.05,
+    "skyPersist": 0.045,
+    "skyScanLimit": 0.45,
+    "skyMedianRadius": 0.005,
+    "skyMinRadius": 0.022,
+    "skyBlurRadius": 0.038,
+    "skyLift": 0.062,
+    "cityDrop": 0.006,
+    "cityMaxRadius": 0.003,
+    "cityCeiling": 0.15,
+
+    "tierTop": 0.3,
+    "cellsTop": 300,
+    "cellsBottom": 96,
+    "litWarm": 0.18,
+    "litLum": 0.44,
+
+    "switchShare": 1.0,
+    "switchDepth": 0.6,
+    "switchRate": 1,
+    "breatheShare": 1.0,
+    "breatheDepth": 0.055,
+    "breatheRate": 1,
+
+    "neonChroma": 0.2,
+    "neonTop": 0.44,
+    "neonDepth": 0.05,
+    "neonRate": 1,
+
+    "boardCells": 22,
+    "boardRate": 1,
+    "boardHue": 1.15,
+    "boardDip": 0.5,
+    "boardShare": 0.55,
+    "boardKeep": [
+      [0.598, 0.130, 0.132, 0.310],
+      [0.385, 0.265, 0.072, 0.170]
+    ],
+
+    "haze": 0.03,
+    "hazeAt": [0.52, 0.17],
+
+    "aircraft": 2,
+    "aircraftBand": [0.05, 0.12],
+    "aircraftSpeed": 1,
+
+    "shimmer": 0,
+    "vignette": 0,
+    "saturate": 1,
+    "brightness": 1,
+    "clockStart": 43200,
+    "debug": 0
+  }
+}
