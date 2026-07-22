@@ -9,6 +9,7 @@
     "icon": "node tools/make-icon.js",
     "shortcuts": "electron tools/install-shortcuts.js",
     "living": "electron tools/living.js",
+    "preview": "electron tools/preview.js",
     "postinstall": "node tools/make-icon.js"
   },
   "author": "RMamujee",
