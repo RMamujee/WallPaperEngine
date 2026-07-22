@@ -9,10 +9,21 @@ Built on Electron, so a wallpaper is just a web page.
 ```
 npm install
 npm start
+npm run shortcuts   # Desktop + Start-menu icon (optional, Windows only)
 ```
 
 A tray icon appears; double-click it (or use **Open library...**) to pick a
 wallpaper per monitor.
+
+`npm run shortcuts` writes a `WallpaperForge.lnk` to your Desktop and to the
+Start menu, so the app launches like any installed program and shows up when you
+type "WallpaperForge" in the taskbar search. The shortcuts carry the app's
+AppUserModelID, which is what stops Windows filing it under a generic "Electron"
+taskbar button. `npm run shortcuts -- --remove` deletes them again.
+
+No packaging step is involved — the shortcut just points at the local
+`electron.exe` with this folder as its argument, exactly like `npm start`. Move
+the project folder and you'll need to re-run the command.
 
 ---
 
@@ -54,6 +65,8 @@ Three things fight you when you do this, and all three are handled in
 - **Web / WebGL wallpapers** — any HTML page, with a small runtime API
 - **Video wallpapers** — mp4 / webm / mkv, looped, with optional audio
 - **Slideshows** — a folder of images with crossfade and Ken Burns drift
+- **Self-contained library** — added wallpapers are copied in, so they survive
+  you moving or deleting the original file
 - **Per-monitor** assignment, DPI-aware, survives monitor hot-plug
 - **Pauses on fullscreen** — when a game or video player covers a monitor, that
   surface is hidden natively, so it costs no GPU. Optionally pause everything,
@@ -104,11 +117,37 @@ paused. The window is hidden natively too, but a running rAF still burns CPU.
 
 ### Other types
 
-`"type": "video"` with `"source": "C:/clips/loop.mp4"`, or `"type":
-"slideshow"` with `"folder": "C:/pictures"`. Both are rendered by built-in host
-pages, so they accept `properties` too — `fit`, `playbackRate` for video;
-`interval`, `transition`, `kenBurns`, `shuffle` for slideshows. The library UI's
-**+ Video file** / **+ Image folder** buttons just write these manifests for you.
+`"type": "video"` with `"source": "media/loop.mp4"`, or `"type": "slideshow"`
+with `"folder": "media"`. Both are rendered by built-in host pages, so they
+accept `properties` too — `fit`, `playbackRate` for video; `interval`,
+`transition`, `kenBurns`, `shuffle` for slideshows. Paths may be absolute or
+relative to the wallpaper's own folder.
+
+## Saving wallpapers
+
+The library UI's **+ Video file**, **+ Image**, and **+ Image folder** buttons
+copy what you pick into the wallpaper's own `media/` folder and write a manifest
+that points at *that copy*:
+
+```
+%APPDATA%\WallpaperForge\wallpapers\
+  ocean-loop\
+    wallpaper.json      -> { "type": "video", "source": "media/ocean.mp4" }
+    preview.jpg
+    media\ocean.mp4
+```
+
+So a saved wallpaper keeps working after you move, rename, or delete the file
+you originally picked — the library is self-contained, and switching between
+saved wallpapers is just a click. The cost is disk space: a 500 MB video means
+500 MB in the library. Deleting a wallpaper from the library (the **×** on its
+card) removes its copied media too.
+
+Thumbnails come for free on slideshows (the first image). For video there's no
+frame to point at, so after the copy finishes the main process asks the open
+picker window to decode one frame ~10% into the clip and hand back a JPEG, which
+is saved as `preview.jpg`. It's best-effort — if the decode fails the card keeps
+its generated gradient placeholder.
 
 ## Configuration
 
@@ -141,5 +180,8 @@ src/main/
   tray.js, picker.js, config.js
 src/preload/    the wallpaperForge and library-UI bridges
 src/renderer/builtin/   picker UI + video/slideshow host pages
+tools/
+  make-icon.js          generates assets/app.ico
+  install-shortcuts.js  Desktop + Start-menu .lnk files
 wallpapers/     bundled example wallpapers
 ```
