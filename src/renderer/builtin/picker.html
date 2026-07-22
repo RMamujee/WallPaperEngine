@@ -301,19 +301,30 @@
         font-size: 26px;
       }
       .meta {
-        padding: 10px 12px 12px;
+        padding: 10px 12px 13px;
       }
+      /* The name wraps to a second line rather than being cut with an ellipsis:
+         a wallpaper's name is how you pick it, so it has to be readable in full.
+         The description is clamped instead - those run long, and an unclamped
+         one makes its card taller than the rest of the row. */
       .meta b {
-        display: block;
+        display: -webkit-box;
+        -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
         font-size: 13px;
         font-weight: 600;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
+        line-height: 1.3;
       }
       .meta small {
+        display: -webkit-box;
+        -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
         color: var(--muted);
         font-size: 11px;
+        line-height: 1.35;
+        margin-top: 2px;
       }
       .badge {
         position: absolute;

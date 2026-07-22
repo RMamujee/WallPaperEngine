@@ -6,7 +6,7 @@
  * Every wallpaper is a directory containing a `wallpaper.json` manifest:
  *
  *   {
- *     "name": "Nebula Flow",
+ *     "name": "Constellation",
  *     "type": "web" | "video" | "slideshow",
  *     "entry": "index.html",         // web only
  *     "source": "media/loop.mp4",    // video only (abs path or relative to the folder)

@@ -114,8 +114,7 @@ wallpaperForge.onVolume((v) => { /* 0..1 */ });
 **Always honour `onPause`** — stop your `requestAnimationFrame` loop when
 paused. The window is hidden natively too, but a running rAF still burns CPU.
 
-`wallpapers/nebula` (a domain-warped fbm shader) and `wallpapers/particles`
-(a canvas particle network) are complete worked examples.
+`wallpapers/particles` (a canvas particle network) is a complete worked example.
 
 ### Other types
 
