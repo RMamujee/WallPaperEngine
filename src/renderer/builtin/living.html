@@ -1,0 +1,470 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>WallpaperForge - living image</title>
+<style>
+  html,
+  body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #05070c;
+  }
+  canvas {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+  #error {
+    position: fixed;
+    inset: 0;
+    display: none;
+    place-content: center;
+    font: 500 15px/1.6 system-ui, sans-serif;
+    color: #8b93a7;
+    text-align: center;
+    padding: 8vh 10vw;
+  }
+</style>
+<canvas id="gl"></canvas>
+<canvas id="fx"></canvas>
+<div id="error"></div>
+
+<script>
+  /**
+   * "Living image": turns a still painting into an animated wallpaper.
+   *
+   * Nothing here is specific to one picture. The image is a texture, and the
+   * motion is derived from where a pixel sits in the frame:
+   *
+   *   - below `horizon` the UVs are displaced by a travelling sum-of-sines, so
+   *     grass and flowers sway; the amplitude grows toward the bottom because
+   *     foreground plants are nearer and larger
+   *   - the sway is gated on colour saturation, so grey rock and dirt inside the
+   *     same band stay put while vegetation moves
+   *   - above `horizon` a very slow lateral drift moves the sky
+   *   - birds and pollen are drawn on a 2D overlay, which is far easier to make
+   *     crisp than the equivalent signed-distance work in a fragment shader
+   *
+   * Every number is exposed through `properties` so a per-image pass can tune it
+   * without touching this file.
+   */
+
+  const errorBox = document.getElementById('error');
+  const glCanvas = document.getElementById('gl');
+  const fxCanvas = document.getElementById('fx');
+
+  function fail(message) {
+    errorBox.textContent = message;
+    errorBox.style.display = 'grid';
+  }
+
+  const VERT = `#version 300 es
+  in vec2 aPos;
+  out vec2 vUv;
+  void main() {
+    // Y is flipped so that uv.y = 0 is the TOP of both the screen and the
+    // texture. The texture half comes from uploading without UNPACK_FLIP_Y,
+    // which puts the image's first row at t = 0. Every "below the horizon"
+    // test downstream depends on this convention.
+    vUv = vec2(aPos.x * 0.5 + 0.5, 0.5 - aPos.y * 0.5);
+    gl_Position = vec4(aPos, 0.0, 1.0);
+  }`;
+
+  const FRAG = `#version 300 es
+  precision highp float;
+
+  in vec2 vUv;
+  out vec4 fragColor;
+
+  uniform sampler2D uImage;
+  uniform vec2  uResolution;
+  uniform float uImageAspect;
+  uniform float uTime;
+  uniform int   uFit;          // 0 cover, 1 contain, 2 blur-extend
+  uniform vec2  uFocus;
+  uniform float uHorizon;
+  uniform float uWind;
+  uniform float uWindSpeed;
+  uniform float uVegFloor;     // how much non-vegetation still moves
+  uniform float uSkyDrift;
+  uniform float uShimmer;
+  uniform float uParallax;
+  uniform vec2  uCursor;
+  uniform float uVignette;
+  uniform float uSaturate;
+  uniform float uBrightness;
+
+  /** Screen UV -> image UV for a cover (crop) fit. */
+  vec2 coverUv(vec2 uv) {
+    float screenAspect = uResolution.x / uResolution.y;
+    vec2 scale = screenAspect > uImageAspect
+      ? vec2(1.0, uImageAspect / screenAspect)
+      : vec2(screenAspect / uImageAspect, 1.0);
+    return (uv - 0.5) * scale + uFocus;
+  }
+
+  /** Screen UV -> image UV for a contain (letterbox) fit. */
+  vec2 containUv(vec2 uv) {
+    float screenAspect = uResolution.x / uResolution.y;
+    vec2 scale = screenAspect > uImageAspect
+      ? vec2(screenAspect / uImageAspect, 1.0)
+      : vec2(1.0, uImageAspect / screenAspect);
+    return (uv - 0.5) * scale + 0.5;
+  }
+
+  float saturation(vec3 c) {
+    float hi = max(c.r, max(c.g, c.b));
+    float lo = min(c.r, min(c.g, c.b));
+    return hi <= 0.0001 ? 0.0 : (hi - lo) / hi;
+  }
+
+  /**
+   * Wind displacement in image space. Layered sines at different frequencies
+   * avoid the single-frequency "everything waves in lockstep" look, and the
+   * gust term is deliberately slow so the field breathes rather than vibrates.
+   */
+  vec2 windOffset(vec2 iuv, float vegetation) {
+    float depth = clamp((iuv.y - uHorizon) / max(0.0001, 1.0 - uHorizon), 0.0, 1.0);
+    if (depth <= 0.0) return vec2(0.0);
+
+    float t = uTime * uWindSpeed;
+    float amp = uWind * pow(depth, 1.4) * vegetation;
+
+    float gust = 0.55 + 0.45 * sin(iuv.x * 2.3 - t * 0.55) * sin(iuv.x * 0.7 + t * 0.21);
+    float sway = sin(iuv.y * 34.0 + iuv.x *  9.0 + t * 2.1)
+               + 0.55 * sin(iuv.y * 71.0 - iuv.x *  4.0 - t * 3.3 + 1.7)
+               + 0.30 * sin(iuv.x * 17.0 + t * 1.3);
+    sway *= 0.5;
+
+    // Mostly lateral; a little vertical keeps it from looking like a shear.
+    return vec2(sway * amp * gust, sway * amp * gust * 0.22);
+  }
+
+  void main() {
+    // Cursor parallax nudges the whole frame a few pixels. Foreground shifts
+    // more than sky, which is what sells the depth.
+    vec2 parallax = (uCursor - 0.5) * uParallax;
+
+    vec2 sharpUv = (uFit == 0 ? coverUv(vUv) : containUv(vUv));
+    sharpUv += parallax * vec2(1.0, 0.6);
+
+    // Sample undisplaced first: we need this pixel's saturation to decide how
+    // much it should move at all. Do not name it "flat" - that is a reserved
+    // interpolation qualifier in GLSL ES 3. Avoid backticks in here too: this
+    // shader is a JS template literal, and one would end the string early.
+    vec3 unmoved = texture(uImage, clamp(sharpUv, 0.0, 1.0)).rgb;
+    float vegetation = mix(uVegFloor, 1.0, smoothstep(0.12, 0.42, saturation(unmoved)));
+
+    vec2 offset = windOffset(sharpUv, vegetation);
+
+    // Sky: a very slow sine rather than a constant drift, so the sky can never
+    // walk off the edge of the texture no matter how long the wallpaper runs.
+    // Gated on brightness as well as height, because sliding a featureless blue
+    // sky produces no visible change while sliding the rock below it looks
+    // broken -- only the bright cloud masses are worth moving.
+    float skyMask = 1.0 - smoothstep(uHorizon - 0.18, uHorizon + 0.02, sharpUv.y);
+    float cloudness = smoothstep(0.62, 0.88, dot(unmoved, vec3(0.3333)));
+    offset.x += sin(uTime * 0.045) * uSkyDrift * skyMask * cloudness;
+
+    vec2 finalUv = sharpUv + offset;
+    vec3 color = texture(uImage, clamp(finalUv, 0.0, 1.0)).rgb;
+
+    // Blur-extend: portrait art on a landscape screen keeps its whole
+    // composition, with the empty sides filled by a blurred blow-up of itself.
+    if (uFit == 2) {
+      vec2 bgUv = clamp(coverUv(vUv) + parallax * 0.35, 0.0, 1.0);
+      // LOD 5 keeps a hint of the painting's shapes; higher flattens it to a
+      // single muddy colour, lower competes with the sharp image for attention.
+      vec3 bg = textureLod(uImage, bgUv, 5.0).rgb;
+      bg = mix(bg, vec3(dot(bg, vec3(0.299, 0.587, 0.114))), 0.12) * 0.72;
+
+      vec2 d = min(finalUv, 1.0 - finalUv);
+      float inside = smoothstep(0.0, 0.006, min(d.x, d.y));
+      color = mix(bg, color, inside);
+    }
+
+    // Light breathing: clouds crossing the sun, not a brightness flicker.
+    color *= 1.0 + uShimmer * sin(uTime * 0.33);
+    color *= uBrightness;
+    color = mix(vec3(dot(color, vec3(0.299, 0.587, 0.114))), color, uSaturate);
+
+    float vig = 1.0 - uVignette * pow(length((vUv - 0.5) * vec2(1.05, 1.0)) * 1.32, 2.4);
+    color *= clamp(vig, 0.0, 1.0);
+
+    fragColor = vec4(color, 1.0);
+  }`;
+
+  function compile(gl, type, source) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      throw new Error(gl.getShaderInfoLog(shader) || 'shader compile failed');
+    }
+    return shader;
+  }
+
+  function buildProgram(gl) {
+    const program = gl.createProgram();
+    gl.attachShader(program, compile(gl, gl.VERTEX_SHADER, VERT));
+    gl.attachShader(program, compile(gl, gl.FRAGMENT_SHADER, FRAG));
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      throw new Error(gl.getProgramInfoLog(program) || 'program link failed');
+    }
+    return program;
+  }
+
+  const FIT_MODES = { cover: 0, contain: 1, blur: 2 };
+
+  function loadImage(src) {
+    return new Promise((resolve, reject) => {
+      const image = new Image();
+      // This page is wf://builtin and the image is wf://media - separate
+      // origins, so without opting in to CORS the texture upload is rejected.
+      // protocol.js answers with access-control-allow-origin.
+      image.crossOrigin = 'anonymous';
+      image.onload = () => resolve(image);
+      image.onerror = () => reject(new Error('Could not load this image.'));
+      image.src = src;
+    });
+  }
+
+  /** Birds and pollen, drawn on a 2D overlay above the shader. */
+  function createOverlay(canvas, props) {
+    const ctx = canvas.getContext('2d');
+    const birdCount = Math.max(0, Math.round(Number(props.birds ?? 7)));
+    const moteCount = Math.max(0, Math.round(Number(props.motes ?? 40)));
+    const band = props.birdBand || [0.08, 0.42];
+    const birdSpeed = Number(props.birdSpeed ?? 1);
+
+    let width = 1;
+    let height = 1;
+    const birds = [];
+    const motes = [];
+
+    const spawnBird = (offscreen) => {
+      // Smaller birds read as further away, so they also fly slower.
+      const scale = 0.35 + Math.random() * 0.65;
+      const dir = Math.random() < 0.5 ? 1 : -1;
+      return {
+        dir,
+        x: offscreen ? (dir > 0 ? -0.08 : 1.08) : Math.random(),
+        y: band[0] + Math.random() * Math.max(0.01, band[1] - band[0]),
+        scale,
+        speed: (0.012 + scale * 0.03) * birdSpeed,
+        flap: Math.random() * Math.PI * 2,
+        flapRate: 5.5 + Math.random() * 3.5,
+        bob: Math.random() * Math.PI * 2
+      };
+    };
+
+    const spawnMote = () => ({
+      x: Math.random(),
+      y: 0.55 + Math.random() * 0.5,
+      r: 0.6 + Math.random() * 1.9,
+      speed: 0.004 + Math.random() * 0.012,
+      drift: Math.random() * Math.PI * 2,
+      alpha: 0.12 + Math.random() * 0.4
+    });
+
+    for (let i = 0; i < birdCount; i++) birds.push(spawnBird(false));
+    for (let i = 0; i < moteCount; i++) motes.push(spawnMote());
+
+    function resize(w, h) {
+      width = w;
+      height = h;
+    }
+
+    function drawBird(bird) {
+      const size = bird.scale * height * 0.016;
+      const x = bird.x * width;
+      const y = (bird.y + Math.sin(bird.bob) * 0.012) * height;
+      // Wings sweep from a shallow V to a deep one; the classic two-arc gull.
+      const lift = Math.sin(bird.flap);
+      const span = size * (0.85 + 0.25 * lift);
+      const drop = size * (0.55 - 0.55 * lift);
+
+      ctx.beginPath();
+      ctx.moveTo(x - span, y + drop);
+      ctx.quadraticCurveTo(x - span * 0.42, y - size * 0.42, x, y);
+      ctx.quadraticCurveTo(x + span * 0.42, y - size * 0.42, x + span, y + drop);
+      ctx.lineWidth = Math.max(1, size * 0.17);
+      ctx.strokeStyle = `rgba(28, 34, 48, ${0.28 + bird.scale * 0.45})`;
+      ctx.lineCap = 'round';
+      ctx.stroke();
+    }
+
+    function update(dt) {
+      for (const bird of birds) {
+        bird.x += bird.dir * bird.speed * dt;
+        bird.flap += bird.flapRate * dt;
+        bird.bob += dt * 0.8;
+        if (bird.x < -0.12 || bird.x > 1.12) Object.assign(bird, spawnBird(true));
+      }
+      for (const mote of motes) {
+        mote.y -= mote.speed * dt;
+        mote.drift += dt * 0.6;
+        mote.x += Math.sin(mote.drift) * 0.0006;
+        if (mote.y < 0.35) Object.assign(mote, spawnMote(), { y: 1.05 });
+      }
+    }
+
+    function draw() {
+      ctx.clearRect(0, 0, width, height);
+
+      for (const mote of motes) {
+        ctx.beginPath();
+        ctx.arc(mote.x * width, mote.y * height, mote.r, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(255, 250, 224, ${mote.alpha})`;
+        ctx.fill();
+      }
+      for (const bird of birds) drawBird(bird);
+    }
+
+    return { resize, update, draw };
+  }
+
+  async function boot() {
+    const config = await window.wallpaperForge.getConfig();
+    if (!config || !config.wallpaper) return fail('No wallpaper assigned.');
+
+    const { payload, properties = {} } = config.wallpaper;
+    if (!payload || !payload.source) return fail('This wallpaper has no image source.');
+
+    const gl = glCanvas.getContext('webgl2', {
+      antialias: false,
+      alpha: false,
+      powerPreference: 'low-power'
+    });
+    if (!gl) return fail('WebGL2 is not available on this machine.');
+
+    const image = await loadImage(payload.source);
+    const program = buildProgram(gl);
+    gl.useProgram(program);
+
+    const buffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+    const aPos = gl.getAttribLocation(program, 'aPos');
+    gl.enableVertexAttribArray(aPos);
+    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+    const texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false); // uv.y = 0 is the top of the image
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    // Mipmaps give the blur-extend background for free via textureLod.
+    gl.generateMipmap(gl.TEXTURE_2D);
+
+    const u = (name) => gl.getUniformLocation(program, name);
+    const uniforms = {
+      resolution: u('uResolution'),
+      imageAspect: u('uImageAspect'),
+      time: u('uTime'),
+      fit: u('uFit'),
+      focus: u('uFocus'),
+      horizon: u('uHorizon'),
+      wind: u('uWind'),
+      windSpeed: u('uWindSpeed'),
+      vegFloor: u('uVegFloor'),
+      skyDrift: u('uSkyDrift'),
+      shimmer: u('uShimmer'),
+      parallax: u('uParallax'),
+      cursor: u('uCursor'),
+      vignette: u('uVignette'),
+      saturate: u('uSaturate'),
+      brightness: u('uBrightness')
+    };
+
+    const num = (value, fallback) => (Number.isFinite(Number(value)) ? Number(value) : fallback);
+    const focus = Array.isArray(properties.focus) ? properties.focus : [0.5, 0.5];
+
+    gl.uniform1i(u('uImage'), 0);
+    gl.uniform1f(uniforms.imageAspect, image.width / image.height);
+    gl.uniform1i(uniforms.fit, FIT_MODES[properties.fit] ?? FIT_MODES.cover);
+    gl.uniform2f(uniforms.focus, num(focus[0], 0.5), num(focus[1], 0.5));
+    gl.uniform1f(uniforms.horizon, num(properties.horizon, 0.62));
+    gl.uniform1f(uniforms.wind, num(properties.wind, 0.0042));
+    gl.uniform1f(uniforms.windSpeed, num(properties.windSpeed, 1));
+    gl.uniform1f(uniforms.vegFloor, num(properties.vegFloor, 0.25));
+    gl.uniform1f(uniforms.skyDrift, num(properties.skyDrift, 0.006));
+    gl.uniform1f(uniforms.shimmer, num(properties.shimmer, 0.012));
+    gl.uniform1f(uniforms.parallax, num(properties.parallax, 0.012));
+    gl.uniform1f(uniforms.vignette, num(properties.vignette, 0.18));
+    gl.uniform1f(uniforms.saturate, num(properties.saturate, 1.04));
+    gl.uniform1f(uniforms.brightness, num(properties.brightness, 1));
+
+    const overlay = createOverlay(fxCanvas, properties);
+    const cursorEnabled = properties.parallax !== 0;
+    let smoothCursor = { x: 0.5, y: 0.5 };
+
+    function resize() {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const w = Math.max(1, Math.round(window.innerWidth * dpr));
+      const h = Math.max(1, Math.round(window.innerHeight * dpr));
+      for (const canvas of [glCanvas, fxCanvas]) {
+        canvas.width = w;
+        canvas.height = h;
+      }
+      gl.viewport(0, 0, w, h);
+      gl.uniform2f(uniforms.resolution, w, h);
+      overlay.resize(w, h);
+    }
+    resize();
+    window.addEventListener('resize', resize);
+
+    let paused = false;
+    let raf = null;
+    let last = performance.now();
+    let clock = 0;
+
+    function frame(now) {
+      raf = requestAnimationFrame(frame);
+      const dt = Math.min(0.05, (now - last) / 1000);
+      last = now;
+      clock += dt;
+
+      if (cursorEnabled) {
+        const { cursor } = window.wallpaperForge.frame();
+        // Ease toward the pointer so the parallax glides instead of snapping.
+        smoothCursor.x += (cursor.x - smoothCursor.x) * Math.min(1, dt * 2.5);
+        smoothCursor.y += (cursor.y - smoothCursor.y) * Math.min(1, dt * 2.5);
+      }
+
+      gl.uniform1f(uniforms.time, clock);
+      gl.uniform2f(uniforms.cursor, smoothCursor.x, smoothCursor.y);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+      overlay.update(dt);
+      overlay.draw();
+    }
+
+    function start() {
+      if (raf !== null) return;
+      last = performance.now();
+      raf = requestAnimationFrame(frame);
+    }
+    function stop() {
+      if (raf === null) return;
+      cancelAnimationFrame(raf);
+      raf = null;
+    }
+
+    window.wallpaperForge.onPause((value) => {
+      paused = value;
+      if (paused) stop();
+      else start();
+    });
+
+    if (!window.wallpaperForge.isPaused()) start();
+  }
+
+  boot().catch((err) => fail(String(err && err.message ? err.message : err)));
+</script>

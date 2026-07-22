@@ -152,6 +152,11 @@ function registerIpc() {
       properties: ['openFile'],
       filters: [{ name: 'Image', extensions: [...library.IMAGE_EXT].map((e) => e.slice(1)) }]
     },
+    living: {
+      title: 'Choose an image to bring to life',
+      properties: ['openFile'],
+      filters: [{ name: 'Image', extensions: [...library.IMAGE_EXT].map((e) => e.slice(1)) }]
+    },
     folder: { title: 'Choose a folder of images', properties: ['openDirectory'] }
   };
 

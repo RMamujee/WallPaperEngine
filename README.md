@@ -65,6 +65,8 @@ Three things fight you when you do this, and all three are handled in
 - **Web / WebGL wallpapers** — any HTML page, with a small runtime API
 - **Video wallpapers** — mp4 / webm / mkv, looped, with optional audio
 - **Slideshows** — a folder of images with crossfade and Ken Burns drift
+- **Living images** — a still painting animated with wind, drifting clouds,
+  birds and pollen, driven entirely by a shader
 - **Self-contained library** — added wallpapers are copied in, so they survive
   you moving or deleting the original file
 - **Per-monitor** assignment, DPI-aware, survives monitor hot-plug
@@ -123,6 +125,64 @@ accept `properties` too — `fit`, `playbackRate` for video; `interval`,
 `transition`, `kenBurns`, `shuffle` for slideshows. Paths may be absolute or
 relative to the wallpaper's own folder.
 
+## Living images
+
+`"type": "living"` animates a **still picture**: no video, no AI, just a shader
+that moves parts of the image based on where they sit in the frame.
+
+- below `horizon`, UVs are displaced by a travelling sum-of-sines, so grass and
+  flowers sway; amplitude grows toward the bottom because foreground plants are
+  nearer and larger
+- the sway is gated on colour saturation, so grey rock and dirt inside the same
+  band stay put while vegetation moves (`vegFloor` sets how much they still move)
+- above `horizon`, bright cloud masses drift very slowly. This is deliberately
+  gated on brightness: sliding a featureless blue sky shows no change anyway,
+  and sliding the rock below it looks broken
+- birds and pollen are drawn on a 2D overlay above the shader
+- the cursor adds a few pixels of parallax
+
+Add one from the picker's **+ Animated image** button, or from the CLI:
+
+```
+npm run living -- add "C:\pics\meadow.png" --name "Meadow Ride"
+npm run living -- set meadow-ride --props-file tune.json
+npm run living -- list
+npm run living -- show meadow-ride
+```
+
+`--props-file` takes a JSON object of any of the properties below. It exists
+because PowerShell 5.1 mangles double quotes when passing arguments to a native
+executable, so inline `--props "{...}"` is unreliable on the only platform this
+app runs on.
+
+| Property | Default | What it does |
+| --- | --- | --- |
+| `fit` | `cover` | `cover` crops to fill, `contain` letterboxes, `blur` fills the gaps with a blurred blow-up of the image |
+| `focus` | `[0.5, 0.5]` | which point of the image to keep when `cover` crops |
+| `horizon` | `0.62` | image-space Y where vegetation starts. **The one value no default can guess** |
+| `wind` | `0.007` | sway amplitude, in image UV units |
+| `windSpeed` | `1` | time multiplier for the sway |
+| `vegFloor` | `0.25` | how much non-vegetation still moves, 0 = only saturated pixels |
+| `skyDrift` | `0.004` | cloud drift amplitude |
+| `shimmer` | `0.012` | slow global brightness breathing |
+| `parallax` | `0.012` | cursor parallax, 0 disables cursor polling |
+| `vignette` / `saturate` / `brightness` | `0.18` / `1.04` / `1` | grading |
+| `birds` | `7` | bird count, 0 = none |
+| `birdBand` | `[0.08, 0.42]` | screen-space Y range they fly in |
+| `birdSpeed` | `1` | multiplier |
+| `motes` | `40` | drifting pollen specks in the lower half |
+
+### Aspect ratio matters more than anything else here
+
+The shader renders at your full display resolution, but it cannot invent detail
+that is not in the source file. For a 2560x1600 screen, a **2560x1600 (16:10)**
+source is what "fullscreen with good detail" actually requires.
+
+A portrait image on a landscape screen has no good answer: `cover` throws away
+most of the composition, `contain` leaves bars. `fit: "blur"` is the least-bad
+option — the whole painting stays visible, centred, with its own blurred
+blow-up filling the sides — but it is a mitigation, not a fix.
+
 ## Saving wallpapers
 
 The library UI's **+ Video file**, **+ Image**, and **+ Image folder** buttons
@@ -179,9 +239,10 @@ src/main/
   audio.js      hidden loopback-capture window
   tray.js, picker.js, config.js
 src/preload/    the wallpaperForge and library-UI bridges
-src/renderer/builtin/   picker UI + video/slideshow host pages
+src/renderer/builtin/   picker UI + video/slideshow/living host pages
 tools/
   make-icon.js          generates assets/app.ico
   install-shortcuts.js  Desktop + Start-menu .lnk files
+  living.js             create/tune living-image wallpapers
 wallpapers/     bundled example wallpapers
 ```

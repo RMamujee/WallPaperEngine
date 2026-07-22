@@ -30,6 +30,26 @@ const { app } = require('electron');
 const IMAGE_EXT = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.avif']);
 const VIDEO_EXT = new Set(['.mp4', '.webm', '.mkv', '.m4v', '.mov']);
 
+/** Starting properties for a `living` wallpaper; see renderer/builtin/living.html. */
+const LIVING_DEFAULTS = {
+  fit: 'cover',
+  focus: [0.5, 0.5],
+  horizon: 0.62,
+  wind: 0.007,
+  windSpeed: 1,
+  vegFloor: 0.25,
+  skyDrift: 0.004,
+  shimmer: 0.012,
+  parallax: 0.012,
+  vignette: 0.18,
+  saturate: 1.04,
+  brightness: 1,
+  birds: 7,
+  birdBand: [0.08, 0.42],
+  birdSpeed: 1,
+  motes: 40
+};
+
 function builtinRoot() {
   return path.join(app.getAppPath(), 'wallpapers');
 }
@@ -136,6 +156,12 @@ function resolveForRender(wallpaper) {
     return { ...base, url: 'wf://builtin/video.html', payload: { source: mediaUrl(file) } };
   }
 
+  // A still image animated by the living-image shader (wind, sky drift, birds).
+  if (wallpaper.type === 'living') {
+    const file = resolveRelative(wallpaper, wallpaper.source);
+    return { ...base, url: 'wf://builtin/living.html', payload: { source: mediaUrl(file) } };
+  }
+
   if (wallpaper.type === 'slideshow') {
     const dir = wallpaper.folder ? resolveRelative(wallpaper, wallpaper.folder) : wallpaper.dir;
     return {
@@ -224,7 +250,20 @@ async function importSource(kind, sourcePath, onProgress) {
 
   let manifest;
   try {
-    if (kind === 'video') {
+    if (kind === 'living') {
+      const [name] = await copyAll([sourcePath], mediaDir, onProgress);
+      manifest = {
+        name: label,
+        type: 'living',
+        source: `media/${name}`,
+        preview: `media/${name}`,
+        audio: false,
+        cursor: true,
+        // Neutral starting point. A per-image tuning pass overwrites these —
+        // `horizon` especially, since it is the one value no default can guess.
+        properties: { ...LIVING_DEFAULTS }
+      };
+    } else if (kind === 'video') {
       const [name] = await copyAll([sourcePath], mediaDir, onProgress);
       manifest = {
         name: label,
@@ -291,6 +330,7 @@ module.exports = {
   importSource,
   setPreview,
   remove,
+  LIVING_DEFAULTS,
   builtinRoot,
   userRoot,
   mediaUrl,
