@@ -11,6 +11,7 @@
     "living": "electron tools/living.js",
     "preview": "electron tools/preview.js",
     "outpaint": "electron tools/outpaint.js",
+    "patch": "electron tools/patch-region.js",
     "postinstall": "node tools/make-icon.js"
   },
   "author": "RMamujee",
