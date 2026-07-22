@@ -52,8 +52,15 @@ const LIVING_DEFAULTS = {
   motes: 40
 };
 
+/**
+ * Resolved from this file rather than `app.getAppPath()` on purpose. Electron
+ * sets the app path to the *script's* directory when it is handed a file
+ * instead of the project folder, so under `electron tools/preview.js` the app
+ * path is `tools/` and the bundled wallpapers become invisible. The CLI tools
+ * would then only ever see the user library.
+ */
 function builtinRoot() {
-  return path.join(app.getAppPath(), 'wallpapers');
+  return path.join(__dirname, '..', '..', 'wallpapers');
 }
 
 function userRoot() {
