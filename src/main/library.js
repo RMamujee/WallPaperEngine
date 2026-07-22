@@ -38,6 +38,8 @@ const LIVING_DEFAULTS = {
   wind: 0.007,
   windSpeed: 1,
   vegFloor: 0.25,
+  earthGuard: 0.85,
+  calm: [],
   skyDrift: 0.004,
   shimmer: 0.012,
   parallax: 0.012,

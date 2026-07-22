@@ -136,9 +136,18 @@ app.whenReady().then(async () => {
   const second = await win.webContents.capturePage();
   fs.writeFileSync(`${out}-b.png`, second.toPNG());
 
+  // Electron writes main-process console output to stderr on Windows, and
+  // PowerShell 5.1 mangles native stderr badly enough that the report can vanish
+  // entirely. Mirror every line to a file so the numbers are always readable.
+  const report = [];
+  const say = (line) => {
+    report.push(line);
+    console.log(line);
+  };
+
   const size = first.getSize();
-  console.log(`captured  : ${size.width}x${size.height}`);
-  console.log(`saved     : ${out}-a.png, ${out}-b.png`);
+  say(`captured  : ${size.width}x${size.height}`);
+  say(`saved     : ${out}-a.png, ${out}-b.png`);
 
   const a = first.toBitmap();
   const b = second.toBitmap();
@@ -147,8 +156,38 @@ app.whenReady().then(async () => {
   for (let i = 0; i < a.length; i += 4) {
     if (a[i] > 8 || a[i + 1] > 8 || a[i + 2] > 8) lit++;
   }
-  console.log(`non-black : ${Math.round((lit / (a.length / 4)) * 100)}%`);
-  console.log(Buffer.compare(a, b) === 0 ? 'motion    : STATIC (nothing is animating)' : 'motion    : ANIMATING');
+  say(`non-black : ${Math.round((lit / (a.length / 4)) * 100)}%`);
+  say(Buffer.compare(a, b) === 0 ? 'motion    : STATIC (nothing is animating)' : 'motion    : ANIMATING');
+
+  // Named rects, for when a horizontal band cannot answer the question. "Did
+  // the horse stay still while the meadow moved" needs this: both live in the
+  // same band, so the band average hides one inside the other.
+  // Separated by "+" rather than ";" on purpose: a semicolon is a statement
+  // separator in PowerShell and gets eaten before the tool ever sees it.
+  if (flags.regions) {
+    for (const spec of flags.regions.split('+').filter(Boolean)) {
+      const [name, nums] = spec.split(':');
+      const [rx, ry, rw, rh] = String(nums).split(',').map(Number);
+      const x0 = Math.max(0, Math.round(rx * size.width));
+      const y0 = Math.max(0, Math.round(ry * size.height));
+      const x1 = Math.min(size.width, x0 + Math.round(rw * size.width));
+      const y1 = Math.min(size.height, y0 + Math.round(rh * size.height));
+
+      let sum = 0;
+      let n = 0;
+      let peak = 0;
+      for (let y = y0; y < y1; y++) {
+        for (let x = x0; x < x1; x++) {
+          const i = (y * size.width + x) * 4;
+          const d = (Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2])) / 3;
+          sum += d;
+          n++;
+          if (d > peak) peak = d;
+        }
+      }
+      say(`region ${String(name).padEnd(10)}: mean ${(sum / Math.max(1, n)).toFixed(2)}  peak ${Math.round(peak)}`);
+    }
+  }
 
   const BANDS = 5;
   const rows = Math.floor(size.height / BANDS);
@@ -162,10 +201,11 @@ app.whenReady().then(async () => {
         n += 2;
       }
     }
-    console.log(
-      `band y ${(band / BANDS).toFixed(1)}-${((band + 1) / BANDS).toFixed(1)} : mean delta ${(sum / n).toFixed(2)}`
+    say(`band y ${(band / BANDS).toFixed(1)}-${((band + 1) / BANDS).toFixed(1)} : mean delta ${(sum / n).toFixed(2)}`
     );
   }
+
+  fs.writeFileSync(`${out}-report.txt`, report.join('\n') + '\n');
 
   win.destroy();
   app.exit(0);
