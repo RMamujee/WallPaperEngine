@@ -18,8 +18,11 @@
   }
   /* The snow falls across the whole frame, so this layer covers the screen and
      sits above the shader. Its top is still set from script rather than fixed
-     at 0, because layout() owns the placement. */
-  #fx {
+     at 0, because layout() owns the placement. #lamps is the same idea but
+     only covers the machines' lower panels; it sits under #fx in DOM order so
+     that snow passes in front of the lights, as it does everything else. */
+  #fx,
+  #lamps {
     position: fixed;
     left: 0;
     display: block;
@@ -37,6 +40,7 @@
   }
 </style>
 <canvas id="gl"></canvas>
+<canvas id="lamps"></canvas>
 <canvas id="fx"></canvas>
 <div id="error"></div>
 
@@ -54,8 +58,10 @@
    *     on its own rhythm, the ceiling tubes hum and occasionally stutter, one
    *     machine has a failing tube, and each machine's reflection in the wet
    *     floor brightens and dims with the machine above it
-   *   - the overlay owns the snow, which is confined to the window band so it
-   *     reads as weather on the far side of the glass
+   *   - the lamp overlay owns the small lights on the machines themselves: a
+   *     rail of selection buttons under each glass front and a coin-slot
+   *     indicator beside it, some steady and glowing, some blinking
+   *   - the snow overlay owns the snow, which falls in front of everything
    *
    * Nothing is hand-placed. At boot the plate is measured: the lit band, the
    * seven machines, the ceiling tubes, the floor, and a mask of the night city
@@ -65,6 +71,7 @@
 
   const errorBox = document.getElementById('error');
   const glCanvas = document.getElementById('gl');
+  const lampCanvas = document.getElementById('lamps');
   const fxCanvas = document.getElementById('fx');
 
   function fail(message) {
@@ -421,6 +428,60 @@
     }
     const [fTop, fBot] = peakBand(smoothed(rowLum, 4), Math.round(0.75 * H), Math.round(0.97 * H), 0.45);
 
+    // -- the lower panels, and the colour each machine lights itself with -----
+    //
+    // Everything below the lit glass and above the floor is the machine's
+    // control face: buttons, coin slot, delivery flap. It is the dark part of
+    // an otherwise bright object, which is where a real machine puts its
+    // indicators and where added ones do not have to compete with product art.
+    //
+    // The tint is measured, not chosen, so a lamp belongs to the machine it is
+    // on: the crimson cabinet gets warm buttons and the blue one cold.
+    //
+    // It is read from the CABINET - the panel the lamp is mounted on - and not
+    // from the lit shelves above it. The shelves look like the more obvious
+    // source and they do not work: at night every machine's glass is dominated
+    // by the same fluorescent cyan, so all seven come back the same colour.
+    //
+    // Nor can the result be normalised by its largest channel, which is what
+    // pins that cyan in place: in a blue-lit scene blue is the largest channel
+    // almost everywhere, and forcing it to 255 throws the hue away before it
+    // can be used. Scaling by luminance instead keeps the ratios between the
+    // channels, which is where the hue actually lives.
+    const LAMP_NEUTRAL = [214, 240, 255];
+    const tints = machines.map(([x0, x1]) => {
+      let r = 0;
+      let g = 0;
+      let b = 0;
+      let n = 0;
+      for (let y = gBot; y < fTop; y += 2) {
+        for (let x = x0; x < x1; x += 2) {
+          const s = satAt(x, y);
+          // Painted metal only. The gate drops the grey hardware and the dark
+          // gaps, so a machine with no colour of its own falls through to the
+          // neutral lamp rather than to whatever its coin slot happens to be.
+          if (s < 0.15 || lumAt(x, y) < 0.08) continue;
+          const i = (y * W + x) * 4;
+          r += data[i] * s;
+          g += data[i + 1] * s;
+          b += data[i + 2] * s;
+          n += s;
+        }
+      }
+      if (n < 40) return LAMP_NEUTRAL;
+      r /= n;
+      g /= n;
+      b /= n;
+      const k = 235 / Math.max(1, r * 0.299 + g * 0.587 + b * 0.114);
+      // A little toward white, because the core of a lamp is paler than its
+      // hue - but not so far that the hue identifying the machine is gone.
+      return [
+        Math.round(Math.min(255, lerp(r * k, 255, 0.28))),
+        Math.round(Math.min(255, lerp(g * k, 255, 0.28))),
+        Math.round(Math.min(255, lerp(b * k, 255, 0.28)))
+      ];
+    });
+
     // -- the window: where snow is allowed to fall ---------------------------
     //
     // We are inside the store looking out, so snow may only appear over the
@@ -486,6 +547,8 @@
       glassBand: [gTop / H, gBot / H],
       floorBand: [fTop / H, fBot / H],
       tubeBand: [tTop / H, tBot / H],
+      panelBand: [gBot / H, fTop / H],
+      machineTints: tints,
       machines: machines.map(([a, b]) => [a / W, b / W]),
       tubes: tubes.map(([a, b]) => [a / W, b / W]),
       window: { mw: MW, mh: MH, mask, top: winTop, bottom: winBot, left: winLeft }
@@ -634,6 +697,172 @@
     }
 
     return { step, machineLevels, tubeLevels };
+  }
+
+  // ===========================================================================
+  // The lamps on the machines
+  // ===========================================================================
+
+  /**
+   * The small lights on the machines themselves: a rail of selection buttons
+   * under each glass front, and a coin-slot indicator beside it.
+   *
+   * These are drawn rather than measured, because the plate does not contain
+   * them - but nothing here is hand-placed either. Every position is a
+   * fraction of the machine's own measured span and of the panel band below
+   * its glass, so seven machines of four different widths each get a rail that
+   * fits them, and repainting the plate moves the lights with the machines.
+   *
+   * Two rules come straight from the art. Whole art pixels only, like the
+   * snow: a lamp is a square on the pixel grid, never a fractional rect the
+   * rasteriser will feather. And the glow is concentric hard squares at
+   * falling alpha rather than a radial gradient - soft falloff over pixel art
+   * reads as a smudge on the screen instead of a light in the picture.
+   * Compositing them additively is what makes them read as emitting rather
+   * than as paint.
+   */
+  function createLamps(canvas, plate, props) {
+    const ctx = canvas.getContext('2d');
+    const ART_W = plate.width;
+    const ART_H = plate.height;
+
+    const panelTopArt = plate.panelBand[0] * ART_H;
+    const panelBotArt = plate.panelBand[1] * ART_H;
+    const panelH = Math.max(1, panelBotArt - panelTopArt);
+
+    const size = Math.max(1, Math.round(num(props.lampSize, 5)));
+    const glow = Math.max(0, num(props.lampGlow, 0.55));
+    const bright = clamp01(num(props.lampBright, 0.85));
+    const blinkShare = clamp01(num(props.lampBlinkShare, 0.34));
+    const blinkRate = num(props.lampBlinkRate, 1);
+    const pulseDepth = num(props.lampPulseDepth, 0.22);
+    const pulseRate = num(props.lampPulseRate, 1);
+    const rowAt = num(props.lampRow, 0.1);
+    const spacing = Math.max(6, num(props.lampSpacing, 26));
+    const coinAt = nums(props.lampCoin, [0.8, 0.42]);
+    const idle = clamp01(num(props.lampIdle, 0.12));
+
+    const rnd = mulberry32(Math.round(num(props.seed, 7)) * 668265263 + 11);
+
+    const lamps = [];
+    const addLamp = (x, y, machine, tint, forceBlink, scale) => {
+      const blink = forceBlink || rnd() < blinkShare;
+      lamps.push({
+        x: x,
+        y: y,
+        machine: machine,
+        tint: tint,
+        scale: scale,
+        blink: blink,
+        // Blinkers run at a visible fraction of a second; the steady ones
+        // breathe over ten or twenty, slow enough never to pull the eye.
+        rate: blink
+          ? TAU * blinkRate * (0.35 + 0.9 * rnd())
+          : TAU * pulseRate * (0.05 + 0.12 * rnd()),
+        phase: rnd() * TAU,
+        // Above this the lamp is on. Off-centre thresholds give the short
+        // flashes that stop a rail of them beating like a metronome.
+        threshold: rnd() < 0.4 ? 0.45 : 0,
+        alpha: bright * (0.62 + 0.5 * rnd())
+      });
+    };
+
+    plate.machines.forEach((span, mi) => {
+      const x0 = span[0] * ART_W;
+      const x1 = span[1] * ART_W;
+      const w = x1 - x0;
+      const tint = (plate.machineTints && plate.machineTints[mi]) || [226, 238, 255];
+
+      // Inset from the bezels, then as many buttons as the machine is wide
+      // enough to hold at the given spacing.
+      const inset = w * 0.15;
+      const usable = Math.max(1, w - inset * 2);
+      const count = Math.max(2, Math.min(8, Math.round(usable / spacing)));
+      for (let i = 0; i < count; i++) {
+        addLamp(
+          x0 + inset + (usable * i) / (count - 1),
+          panelTopArt + panelH * rowAt,
+          mi,
+          tint,
+          false,
+          1
+        );
+      }
+
+      // The coin/vend indicator: always blinking, and bigger than a button.
+      addLamp(x0 + w * coinAt[0], panelTopArt + panelH * coinAt[1], mi, tint, true, 1.4);
+    });
+
+    let width = 1;
+    let height = 1;
+    let unit = 1; // screen pixels per art pixel
+    let originX = 0;
+    let originY = 0; // art origin relative to the TOP OF THIS CANVAS
+
+    /** The same cover fit the shader and the snow use. This canvas only has to
+        cover the panel band, plus room for the widest halo. */
+    function layout(w, h) {
+      const screenAspect = w / h;
+      const imageAspect = ART_W / ART_H;
+      const sx = screenAspect > imageAspect ? 1 : screenAspect / imageAspect;
+      unit = w / sx / ART_W;
+      originX = w / 2 - (ART_W / 2) * unit;
+      const artTop = h / 2 - (ART_H / 2) * unit;
+
+      const pad = Math.round(size * 4 * unit) + 2;
+      const top = Math.max(0, Math.round(artTop + panelTopArt * unit) - pad);
+      const bottom = Math.min(h, Math.round(artTop + panelBotArt * unit) + pad);
+      originY = artTop - top;
+      width = w;
+      height = Math.max(1, bottom - top);
+      return { top: top, height: height };
+    }
+
+    const rgba = (tint, a) => 'rgba(' + tint[0] + ', ' + tint[1] + ', ' + tint[2] + ', ' + a + ')';
+
+    function drawLamp(lamp, a) {
+      if (a <= 0.004) return;
+      const px = Math.max(1, Math.round(size * lamp.scale * unit));
+      const x = Math.round(originX + lamp.x * unit);
+      const y = Math.round(originY + lamp.y * unit);
+
+      // Halo first: two hard squares around the core, each dimmer than the last.
+      for (let ring = 2; ring >= 1; ring--) {
+        const grow = px * ring;
+        ctx.fillStyle = rgba(lamp.tint, a * glow * (ring === 2 ? 0.11 : 0.26));
+        ctx.fillRect(x - grow, y - grow, px + grow * 2, px + grow * 2);
+      }
+      ctx.fillStyle = rgba(lamp.tint, a);
+      ctx.fillRect(x, y, px, px);
+    }
+
+    /**
+     * `levels` is the per-machine brightness the shader is using this frame, so
+     * a machine's buttons sag and flutter with the machine they are bolted to,
+     * the failing one included.
+     */
+    function draw(time, levels) {
+      ctx.clearRect(0, 0, width, height);
+      // Additive: a light adds to what is behind it. Over the dark control
+      // panel that is what separates a lamp from a painted dot.
+      ctx.globalCompositeOperation = 'lighter';
+      for (const lamp of lamps) {
+        const level = levels && levels.length > lamp.machine ? levels[lamp.machine] : 1;
+        let a = lamp.alpha * level;
+        if (lamp.blink) {
+          const on = Math.sin(time * lamp.rate + lamp.phase) > lamp.threshold;
+          // Never all the way out: an unlit indicator still catches the light
+          // of the machine it sits on, and blinking to pure black strobes.
+          a *= on ? 1 : idle;
+        } else {
+          a *= 1 + pulseDepth * Math.sin(time * lamp.rate + lamp.phase);
+        }
+        drawLamp(lamp, clamp01(a));
+      }
+      ctx.globalCompositeOperation = 'source-over';
+    }
+
+    return { layout: layout, draw: draw };
   }
 
   // ===========================================================================
@@ -908,6 +1137,7 @@
     const uTube = u('uTube');
 
     const lights = createLights(properties, plate.machines.length, plate.tubes.length);
+    const lamps = createLamps(lampCanvas, plate, properties);
     const snow = createSnow(fxCanvas, plate, properties);
     const uResolution = u('uResolution');
     const uTime = u('uTime');
@@ -928,6 +1158,13 @@
       fxCanvas.style.top = rect.top / dpr + 'px';
       fxCanvas.style.width = w / dpr + 'px';
       fxCanvas.style.height = rect.height / dpr + 'px';
+
+      const lampRect = lamps.layout(w, h);
+      lampCanvas.width = w;
+      lampCanvas.height = lampRect.height;
+      lampCanvas.style.top = lampRect.top / dpr + 'px';
+      lampCanvas.style.width = w / dpr + 'px';
+      lampCanvas.style.height = lampRect.height / dpr + 'px';
     }
     resize();
     window.addEventListener('resize', resize);
@@ -953,6 +1190,9 @@
       gl.uniform4fv(uTube, tubeData);
       gl.uniform1f(uTime, clock);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+      // Lamps under the snow, so a flake crosses in front of a lit button.
+      lamps.draw(clock, lights.machineLevels);
 
       snow.update(dt, clock);
       snow.draw(clock);
