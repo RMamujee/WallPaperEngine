@@ -1,0 +1,551 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>WallpaperForge</title>
+    <style>
+      :root {
+        --bg: #0b0d12;
+        --panel: #12151d;
+        --panel-2: #171b25;
+        --line: #232838;
+        --text: #e7ebf3;
+        --muted: #8b93a7;
+        --accent: #6ee7ff;
+        --accent-2: #7c5cff;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: var(--bg);
+        color: var(--text);
+        font: 14px/1.5 "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
+        overflow: hidden;
+      }
+      #app {
+        display: grid;
+        grid-template-columns: 268px 1fr;
+        height: 100%;
+      }
+
+      aside {
+        background: var(--panel);
+        border-right: 1px solid var(--line);
+        padding: 20px 18px;
+        overflow-y: auto;
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 22px;
+      }
+      .dot {
+        width: 22px;
+        height: 22px;
+        border-radius: 7px;
+        background: linear-gradient(135deg, var(--accent), var(--accent-2));
+        box-shadow: 0 0 18px rgba(110, 231, 255, 0.35);
+      }
+      .brand h1 {
+        font-size: 15px;
+        margin: 0;
+        letter-spacing: 0.2px;
+      }
+      .brand span {
+        display: block;
+        font-size: 11px;
+        color: var(--muted);
+        font-weight: 400;
+      }
+
+      h2 {
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.09em;
+        color: var(--muted);
+        margin: 22px 0 10px;
+      }
+
+      .monitor {
+        width: 100%;
+        text-align: left;
+        background: var(--panel-2);
+        border: 1px solid var(--line);
+        color: var(--text);
+        border-radius: 10px;
+        padding: 10px 12px;
+        margin-bottom: 8px;
+        cursor: pointer;
+        transition: border-color 0.15s, background 0.15s;
+      }
+      .monitor:hover {
+        border-color: #34405c;
+      }
+      .monitor.active {
+        border-color: var(--accent);
+        background: linear-gradient(180deg, rgba(110, 231, 255, 0.09), transparent);
+      }
+      .monitor b {
+        display: block;
+        font-size: 13px;
+        font-weight: 600;
+      }
+      .monitor small {
+        color: var(--muted);
+        font-size: 11px;
+      }
+
+      .row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        padding: 7px 0;
+        font-size: 13px;
+      }
+      .row small {
+        color: var(--muted);
+        display: block;
+        font-size: 11px;
+      }
+
+      /* iOS-style switch */
+      .switch {
+        position: relative;
+        width: 38px;
+        height: 21px;
+        flex: none;
+      }
+      .switch input {
+        opacity: 0;
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        cursor: pointer;
+      }
+      .switch span {
+        position: absolute;
+        inset: 0;
+        border-radius: 999px;
+        background: #2a3145;
+        transition: background 0.18s;
+        pointer-events: none;
+      }
+      .switch span::after {
+        content: "";
+        position: absolute;
+        width: 15px;
+        height: 15px;
+        border-radius: 50%;
+        background: #fff;
+        top: 3px;
+        left: 3px;
+        transition: transform 0.18s;
+      }
+      .switch input:checked + span {
+        background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      }
+      .switch input:checked + span::after {
+        transform: translateX(17px);
+      }
+
+      input[type="range"] {
+        width: 100%;
+        accent-color: var(--accent);
+      }
+
+      button.action {
+        width: 100%;
+        background: var(--panel-2);
+        border: 1px solid var(--line);
+        color: var(--text);
+        border-radius: 9px;
+        padding: 9px 12px;
+        font-size: 13px;
+        cursor: pointer;
+        margin-bottom: 8px;
+        text-align: left;
+        transition: border-color 0.15s;
+      }
+      button.action:hover {
+        border-color: #34405c;
+      }
+
+      main {
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        padding: 18px 24px;
+        border-bottom: 1px solid var(--line);
+      }
+      header h3 {
+        margin: 0;
+        font-size: 15px;
+      }
+      header p {
+        margin: 2px 0 0;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        border: 1px solid var(--line);
+        background: var(--panel);
+        border-radius: 999px;
+        padding: 6px 13px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .pill i {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: #3ddc97;
+        box-shadow: 0 0 8px #3ddc97;
+      }
+      .pill.paused i {
+        background: #ffb020;
+        box-shadow: 0 0 8px #ffb020;
+      }
+
+      .grid {
+        flex: 1;
+        overflow-y: auto;
+        padding: 22px 24px 40px;
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(226px, 1fr));
+        gap: 16px;
+        align-content: start;
+      }
+
+      .card {
+        position: relative;
+        border-radius: 13px;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        background: var(--panel);
+        cursor: pointer;
+        transition: transform 0.15s, border-color 0.15s;
+      }
+      .card:hover {
+        transform: translateY(-3px);
+        border-color: #34405c;
+      }
+      .card.selected {
+        border-color: var(--accent);
+        box-shadow: 0 0 0 1px var(--accent), 0 10px 30px rgba(110, 231, 255, 0.12);
+      }
+      .thumb {
+        aspect-ratio: 16 / 9;
+        background-size: cover;
+        background-position: center;
+        display: grid;
+        place-items: center;
+        color: rgba(255, 255, 255, 0.5);
+        font-size: 26px;
+      }
+      .meta {
+        padding: 10px 12px 12px;
+      }
+      .meta b {
+        display: block;
+        font-size: 13px;
+        font-weight: 600;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .meta small {
+        color: var(--muted);
+        font-size: 11px;
+      }
+      .badge {
+        position: absolute;
+        top: 9px;
+        left: 9px;
+        background: rgba(6, 8, 13, 0.72);
+        backdrop-filter: blur(6px);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        font-size: 10px;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        padding: 3px 7px;
+        color: var(--muted);
+      }
+      .del {
+        position: absolute;
+        top: 9px;
+        right: 9px;
+        width: 24px;
+        height: 24px;
+        border-radius: 6px;
+        border: 1px solid var(--line);
+        background: rgba(6, 8, 13, 0.72);
+        color: var(--muted);
+        cursor: pointer;
+        display: none;
+        line-height: 1;
+      }
+      .card:hover .del {
+        display: block;
+      }
+      .del:hover {
+        color: #ff6b6b;
+        border-color: #ff6b6b;
+      }
+      .empty {
+        grid-column: 1 / -1;
+        text-align: center;
+        color: var(--muted);
+        padding: 60px 20px;
+      }
+      footer {
+        border-top: 1px solid var(--line);
+        padding: 9px 24px;
+        font-size: 11px;
+        color: var(--muted);
+        display: flex;
+        justify-content: space-between;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <aside>
+        <div class="brand">
+          <div class="dot"></div>
+          <h1>WallpaperForge<span>animated desktop engine</span></h1>
+        </div>
+
+        <h2>Monitors</h2>
+        <div id="monitors"></div>
+
+        <h2>Add</h2>
+        <button class="action" id="add-video">+ Video file (mp4 / webm)</button>
+        <button class="action" id="add-folder">+ Image folder (slideshow)</button>
+        <button class="action" id="open-folder">Open wallpapers folder</button>
+
+        <h2>Behaviour</h2>
+        <label class="row">
+          <span>Pause when fullscreen<small>Games and video players</small></span>
+          <span class="switch"><input type="checkbox" id="pauseOnFullscreen" /><span></span></span>
+        </label>
+        <label class="row">
+          <span>Pause on battery</span>
+          <span class="switch"><input type="checkbox" id="pauseOnBattery" /><span></span></span>
+        </label>
+        <label class="row">
+          <span>Audio reactive<small>Reacts to system sound</small></span>
+          <span class="switch"><input type="checkbox" id="audioReactive" /><span></span></span>
+        </label>
+        <label class="row">
+          <span>Cursor tracking</span>
+          <span class="switch"><input type="checkbox" id="cursorTracking" /><span></span></span>
+        </label>
+        <label class="row">
+          <span>Start with Windows</span>
+          <span class="switch"><input type="checkbox" id="launchOnStartup" /><span></span></span>
+        </label>
+
+        <h2>Wallpaper volume</h2>
+        <input type="range" id="volume" min="0" max="100" step="1" />
+      </aside>
+
+      <main>
+        <header>
+          <div>
+            <h3 id="target">Wallpaper library</h3>
+            <p id="hint">Pick a wallpaper to apply it to the selected monitor.</p>
+          </div>
+          <div style="display: flex; gap: 10px; align-items: center">
+            <span class="pill" id="status"><i></i><span>running</span></span>
+            <button class="action" style="width: auto; margin: 0" id="pause">Pause all</button>
+            <button class="action" style="width: auto; margin: 0" id="reload">Reload</button>
+          </div>
+        </header>
+        <div class="grid" id="grid"></div>
+        <footer>
+          <span id="hostinfo"></span>
+          <span>Wallpapers live in %APPDATA%\WallpaperForge\wallpapers</span>
+        </footer>
+      </main>
+    </div>
+
+    <script>
+      const TYPE_ICON = { web: "◇", video: "▶", slideshow: "❑" };
+      let state = null;
+      let selectedDisplay = null;
+
+      const $ = (id) => document.getElementById(id);
+
+      function gradientFor(id) {
+        // Deterministic per-wallpaper placeholder so cards without a preview
+        // still look intentional rather than empty.
+        let hash = 0;
+        for (let i = 0; i < id.length; i++) hash = (hash * 31 + id.charCodeAt(i)) >>> 0;
+        const h1 = hash % 360;
+        const h2 = (h1 + 60 + (hash % 90)) % 360;
+        return `linear-gradient(135deg, hsl(${h1} 62% 26%), hsl(${h2} 58% 14%))`;
+      }
+
+      function renderMonitors() {
+        const host = $("monitors");
+        host.innerHTML = "";
+        for (const display of state.displays) {
+          const wallpaper = state.wallpapers.find((w) => w.id === display.wallpaperId);
+          const button = document.createElement("button");
+          button.className = "monitor" + (display.id === selectedDisplay ? " active" : "");
+          button.innerHTML = `<b>${display.label}${display.primary ? " • primary" : ""}</b>
+            <small>${display.bounds.width}×${display.bounds.height} — ${
+              wallpaper ? wallpaper.name : "no wallpaper"
+            }</small>`;
+          button.onclick = () => {
+            selectedDisplay = display.id;
+            render();
+          };
+          host.appendChild(button);
+        }
+      }
+
+      function renderGrid() {
+        const grid = $("grid");
+        grid.innerHTML = "";
+        const display = state.displays.find((d) => d.id === selectedDisplay);
+
+        if (!state.wallpapers.length) {
+          grid.innerHTML =
+            '<div class="empty">No wallpapers yet.<br />Add a video file or an image folder from the left.</div>';
+          return;
+        }
+
+        for (const wallpaper of state.wallpapers) {
+          const card = document.createElement("div");
+          const selected = display && display.wallpaperId === wallpaper.id;
+          card.className = "card" + (selected ? " selected" : "");
+          card.innerHTML = `
+            <div class="thumb" style="${
+              wallpaper.preview
+                ? `background-image:url('${wallpaper.preview}')`
+                : `background:${gradientFor(wallpaper.id)}`
+            }">${wallpaper.preview ? "" : TYPE_ICON[wallpaper.type] || ""}</div>
+            <div class="badge">${wallpaper.type}</div>
+            ${wallpaper.builtin ? "" : '<button class="del" title="Delete">×</button>'}
+            <div class="meta">
+              <b>${wallpaper.name}</b>
+              <small>${wallpaper.description || (wallpaper.builtin ? "built in" : "custom")}</small>
+            </div>`;
+
+          card.onclick = async () => {
+            if (!selectedDisplay) return;
+            state = await window.forge.apply(selectedDisplay, selected ? null : wallpaper.id);
+            render();
+          };
+
+          const del = card.querySelector(".del");
+          if (del) {
+            del.onclick = async (event) => {
+              event.stopPropagation();
+              state = await window.forge.remove(wallpaper.id);
+              render();
+            };
+          }
+          grid.appendChild(card);
+        }
+      }
+
+      function renderSettings() {
+        for (const key of [
+          "pauseOnFullscreen",
+          "pauseOnBattery",
+          "audioReactive",
+          "cursorTracking",
+          "launchOnStartup"
+        ]) {
+          $(key).checked = !!state.settings[key];
+        }
+        $("volume").value = Math.round((state.settings.volume || 0) * 100);
+
+        const paused = state.status.manualPause;
+        $("pause").textContent = paused ? "Resume all" : "Pause all";
+        const pill = $("status");
+        pill.className = "pill" + (paused || state.status.reason !== "running" ? " paused" : "");
+        pill.lastElementChild.textContent = state.status.reason;
+        $("hostinfo").textContent =
+          `desktop layer: ${state.status.host}` + (state.status.audio ? " • audio capture on" : "");
+      }
+
+      function render() {
+        if (!state.displays.some((d) => d.id === selectedDisplay)) {
+          selectedDisplay = state.displays.length ? state.displays[0].id : null;
+        }
+        const display = state.displays.find((d) => d.id === selectedDisplay);
+        $("target").textContent = display ? `Library — ${display.label}` : "Library";
+        renderMonitors();
+        renderGrid();
+        renderSettings();
+      }
+
+      async function refresh() {
+        state = await window.forge.state();
+        render();
+      }
+
+      for (const key of [
+        "pauseOnFullscreen",
+        "pauseOnBattery",
+        "audioReactive",
+        "cursorTracking",
+        "launchOnStartup"
+      ]) {
+        $(key).onchange = async (event) => {
+          state = await window.forge.settings({ [key]: event.target.checked });
+          render();
+        };
+      }
+
+      let volumeTimer = null;
+      $("volume").oninput = (event) => {
+        clearTimeout(volumeTimer);
+        const value = Number(event.target.value) / 100;
+        volumeTimer = setTimeout(async () => {
+          state = await window.forge.settings({ volume: value });
+        }, 120);
+      };
+
+      $("add-video").onclick = async () => {
+        state = await window.forge.import("video");
+        render();
+      };
+      $("add-folder").onclick = async () => {
+        state = await window.forge.import("folder");
+        render();
+      };
+      $("open-folder").onclick = () => window.forge.openFolder();
+      $("reload").onclick = async () => {
+        state = await window.forge.reload();
+        render();
+      };
+      $("pause").onclick = async () => {
+        state = await window.forge.pause(!state.status.manualPause);
+        render();
+      };
+
+      refresh();
+      setInterval(refresh, 2500);
+    </script>
+  </body>
+</html>

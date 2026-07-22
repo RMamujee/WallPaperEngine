@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Nebula Drift</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: #04060d;
+      }
+      canvas {
+        display: block;
+        width: 100%;
+        height: 100%;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="c"></canvas>
+
+    <script id="vs" type="x-shader/x-vertex">
+      attribute vec2 aPos;
+      void main() { gl_Position = vec4(aPos, 0.0, 1.0); }
+    </script>
+
+    <script id="fs" type="x-shader/x-fragment">
+      precision highp float;
+
+      uniform vec2  uRes;
+      uniform float uTime;
+      uniform vec2  uMouse;
+      uniform float uBass;
+      uniform float uMid;
+      uniform float uTreble;
+      uniform float uIntensity;
+      uniform float uHueShift;
+
+      float hash(vec2 p) {
+        return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
+      }
+
+      float noise(vec2 p) {
+        vec2 i = floor(p);
+        vec2 f = fract(p);
+        vec2 u = f * f * (3.0 - 2.0 * f);
+        return mix(
+          mix(hash(i), hash(i + vec2(1.0, 0.0)), u.x),
+          mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), u.x),
+          u.y
+        );
+      }
+
+      float fbm(vec2 p) {
+        float v = 0.0;
+        float a = 0.5;
+        for (int i = 0; i < 6; i++) {
+          v += a * noise(p);
+          p = p * 2.03 + vec2(1.7, 9.2);
+          a *= 0.5;
+        }
+        return v;
+      }
+
+      // Rotate hue of a linear-ish RGB colour without a full HSV round trip.
+      vec3 hueRotate(vec3 c, float a) {
+        const vec3 k = vec3(0.57735);
+        float cosA = cos(a);
+        return c * cosA + cross(k, c) * sin(a) + k * dot(k, c) * (1.0 - cosA);
+      }
+
+      void main() {
+        vec2 uv = (gl_FragCoord.xy - 0.5 * uRes) / min(uRes.x, uRes.y);
+
+        // Cursor gives a gentle parallax pull rather than a hard follow.
+        vec2 parallax = (uMouse - 0.5) * 0.22;
+        vec2 p = uv * 1.65 + parallax;
+
+        float t = uTime * 0.08;
+
+        // Two levels of domain warping - the first bends the field, the second
+        // bends the bend, which is what produces the wispy nebula filaments.
+        vec2 q = vec2(fbm(p + vec2(0.0, t)), fbm(p + vec2(5.2, 1.3) - t * 0.6));
+        vec2 r = vec2(
+          fbm(p + 3.4 * q + vec2(1.7, 9.2) + 0.15 * t),
+          fbm(p + 3.4 * q + vec2(8.3, 2.8) + 0.126 * t)
+        );
+        float f = fbm(p + 3.2 * r + uBass * 0.35);
+
+        // Remap the field so most of the frame stays near-black and only the
+        // folds light up. Without this the mixes below average out into a flat
+        // mid-tone haze instead of reading as gas against empty space.
+        float density = pow(clamp(f * 1.45 - 0.22, 0.0, 1.0), 1.7);
+
+        vec3 deep   = vec3(0.012, 0.018, 0.055);
+        vec3 indigo = vec3(0.16, 0.09, 0.44);
+        vec3 rose   = vec3(0.92, 0.22, 0.55);
+        vec3 cyan   = vec3(0.35, 0.95, 1.00);
+
+        vec3 col = deep;
+        col = mix(col, indigo, smoothstep(0.02, 0.55, density));
+        col = mix(col, rose, smoothstep(0.34, 0.92, density) * (0.5 + uMid * 0.4));
+        col = mix(col, cyan, smoothstep(0.55, 1.0, r.x * 1.5) * (0.3 + uTreble * 0.45));
+
+        // Bright cores where the warp folds back on itself.
+        float core = smoothstep(0.72, 1.0, density + uBass * 0.18);
+        col += core * vec3(0.55, 0.42, 0.85) * (1.0 + uBass * 1.8);
+
+        // Sparse starfield, twinkling on the high end of the spectrum.
+        vec2 sp = gl_FragCoord.xy * 0.55;
+        float star = pow(hash(floor(sp)), 260.0);
+        star *= 0.6 + 0.4 * sin(uTime * 2.4 + hash(floor(sp)) * 40.0);
+        col += star * (0.8 + uTreble * 1.4);
+
+        col *= uIntensity;
+        col = hueRotate(col, uHueShift);
+
+        // Vignette keeps the icons readable near the screen edges.
+        col *= 1.0 - 0.55 * dot(uv, uv);
+
+        // Filmic-ish tone curve, then gamma back up so highlights roll off
+        // without dragging the blacks into grey.
+        col = col / (col + 0.55);
+        col = pow(col, vec3(1.05));
+
+        // Ordered-ish dither: 8-bit gradients this smooth band badly otherwise.
+        col += (hash(gl_FragCoord.xy) - 0.5) / 255.0;
+
+        gl_FragColor = vec4(col, 1.0);
+      }
+    </script>
+
+    <script>
+      const canvas = document.getElementById("c");
+      const gl = canvas.getContext("webgl", { antialias: false, alpha: false, powerPreference: "low-power" });
+
+      if (!gl) {
+        document.body.style.background = "#12060d";
+        throw new Error("WebGL unavailable");
+      }
+
+      function compile(type, source) {
+        const shader = gl.createShader(type);
+        gl.shaderSource(shader, source);
+        gl.compileShader(shader);
+        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+          throw new Error(gl.getShaderInfoLog(shader));
+        }
+        return shader;
+      }
+
+      const program = gl.createProgram();
+      gl.attachShader(program, compile(gl.VERTEX_SHADER, document.getElementById("vs").textContent));
+      gl.attachShader(program, compile(gl.FRAGMENT_SHADER, document.getElementById("fs").textContent));
+      gl.linkProgram(program);
+      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program));
+      gl.useProgram(program);
+
+      // One oversized triangle covers the viewport with no wasted fragments.
+      const buffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+      const aPos = gl.getAttribLocation(program, "aPos");
+      gl.enableVertexAttribArray(aPos);
+      gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+      const u = {};
+      for (const name of ["uRes", "uTime", "uMouse", "uBass", "uMid", "uTreble", "uIntensity", "uHueShift"]) {
+        u[name] = gl.getUniformLocation(program, name);
+      }
+
+      const props = { speed: 1, intensity: 1, hueShift: 0, audioResponse: 1 };
+      const smooth = { bass: 0, mid: 0, treble: 0, mx: 0.5, my: 0.5 };
+      let running = true;
+      let clock = 0;
+      let last = performance.now();
+
+      function resize() {
+        // Cap the render scale: a 4K nebula at DPR 1.5 is a lot of fragments
+        // for something that sits behind icons.
+        const scale = Math.min(window.devicePixelRatio || 1, 1.25);
+        const w = Math.round(window.innerWidth * scale);
+        const h = Math.round(window.innerHeight * scale);
+        if (canvas.width !== w || canvas.height !== h) {
+          canvas.width = w;
+          canvas.height = h;
+          gl.viewport(0, 0, w, h);
+        }
+      }
+
+      function frame(now) {
+        if (!running) return;
+        const dt = Math.min(0.1, (now - last) / 1000);
+        last = now;
+        clock += dt * props.speed;
+
+        resize();
+
+        const data = window.wallpaperForge ? window.wallpaperForge.frame() : null;
+        if (data) {
+          const audio = data.audio || {};
+          const response = props.audioResponse;
+          // Exponential smoothing stops the visuals from strobing on transients.
+          smooth.bass += ((audio.bass || 0) * response - smooth.bass) * 0.18;
+          smooth.mid += ((audio.mid || 0) * response - smooth.mid) * 0.14;
+          smooth.treble += ((audio.treble || 0) * response - smooth.treble) * 0.22;
+          if (data.cursor) {
+            smooth.mx += (data.cursor.x - smooth.mx) * 0.05;
+            smooth.my += (data.cursor.y - smooth.my) * 0.05;
+          }
+        }
+
+        gl.uniform2f(u.uRes, canvas.width, canvas.height);
+        gl.uniform1f(u.uTime, clock);
+        gl.uniform2f(u.uMouse, smooth.mx, 1 - smooth.my);
+        gl.uniform1f(u.uBass, smooth.bass);
+        gl.uniform1f(u.uMid, smooth.mid);
+        gl.uniform1f(u.uTreble, smooth.treble);
+        gl.uniform1f(u.uIntensity, props.intensity);
+        gl.uniform1f(u.uHueShift, props.hueShift);
+
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+        requestAnimationFrame(frame);
+      }
+
+      async function boot() {
+        if (window.wallpaperForge) {
+          const config = await window.wallpaperForge.getConfig();
+          Object.assign(props, (config && config.wallpaper && config.wallpaper.properties) || {});
+          window.wallpaperForge.onPause((paused) => {
+            running = !paused;
+            if (running) {
+              last = performance.now();
+              requestAnimationFrame(frame);
+            }
+          });
+        }
+        resize();
+        requestAnimationFrame(frame);
+      }
+
+      boot();
+    </script>
+  </body>
+</html>

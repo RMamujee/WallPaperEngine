@@ -1,0 +1,128 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>WallpaperForge - slideshow</title>
+<style>
+  html,
+  body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #000;
+  }
+  .layer {
+    position: fixed;
+    inset: -4%;
+    background-size: cover;
+    background-position: center;
+    opacity: 0;
+    transition: opacity var(--fade, 1.6s) ease-in-out;
+    will-change: opacity, transform;
+  }
+  .layer.on {
+    opacity: 1;
+  }
+  .kb {
+    animation: kenburns var(--dwell, 12s) linear forwards;
+  }
+  @keyframes kenburns {
+    from {
+      transform: scale(1) translate3d(0, 0, 0);
+    }
+    to {
+      transform: scale(1.09) translate3d(-1.2%, 1%, 0);
+    }
+  }
+  #error {
+    position: fixed;
+    inset: 0;
+    display: none;
+    place-content: center;
+    font: 500 15px/1.6 system-ui, sans-serif;
+    color: #8b93a7;
+    text-align: center;
+    padding: 8vh 10vw;
+  }
+</style>
+<div class="layer" id="a"></div>
+<div class="layer" id="b"></div>
+<div id="error"></div>
+
+<script>
+  const layers = [document.getElementById('a'), document.getElementById('b')];
+  const errorBox = document.getElementById('error');
+  let images = [];
+  let index = 0;
+  let front = 0;
+  let timer = null;
+  let dwellMs = 12000;
+  let kenBurns = true;
+
+  function fail(message) {
+    errorBox.textContent = message;
+    errorBox.style.display = 'grid';
+  }
+
+  function show(nextIndex) {
+    const back = layers[1 - front];
+    const url = images[nextIndex];
+
+    back.style.backgroundImage = `url("${url.replace(/"/g, '%22')}")`;
+    back.classList.remove('kb');
+    // Force a reflow so the animation restarts from the beginning each time.
+    void back.offsetWidth;
+    if (kenBurns) back.classList.add('kb');
+
+    back.classList.add('on');
+    layers[front].classList.remove('on');
+    front = 1 - front;
+    index = nextIndex;
+  }
+
+  function advance() {
+    if (images.length < 2) return;
+    show((index + 1) % images.length);
+  }
+
+  function startTimer() {
+    stopTimer();
+    if (images.length > 1) timer = setInterval(advance, dwellMs);
+  }
+
+  function stopTimer() {
+    if (timer) clearInterval(timer);
+    timer = null;
+  }
+
+  async function boot() {
+    const config = await window.wallpaperForge.getConfig();
+    if (!config || !config.wallpaper) return fail('No slideshow assigned.');
+
+    const props = config.wallpaper.properties || {};
+    images = (config.wallpaper.payload && config.wallpaper.payload.images) || [];
+    if (!images.length) return fail('No images found in this folder.');
+
+    if (props.shuffle) {
+      for (let i = images.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [images[i], images[j]] = [images[j], images[i]];
+      }
+    }
+
+    dwellMs = Math.max(2000, (Number(props.interval) || 12) * 1000);
+    kenBurns = props.kenBurns !== false;
+    const fadeMs = Math.max(200, (Number(props.transition) || 1.6) * 1000);
+
+    for (const layer of layers) {
+      layer.style.setProperty('--fade', `${fadeMs}ms`);
+      layer.style.setProperty('--dwell', `${dwellMs + fadeMs}ms`);
+      if (props.fit === 'contain') layer.style.backgroundSize = 'contain';
+    }
+
+    show(0);
+    startTimer();
+
+    window.wallpaperForge.onPause((paused) => (paused ? stopTimer() : startTimer()));
+  }
+
+  boot().catch((err) => fail(String(err)));
+</script>

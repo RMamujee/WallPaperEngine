@@ -1,0 +1,83 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>WallpaperForge - audio capture</title>
+<body style="background:#000;color:#8b93a7;font:13px system-ui">
+  <pre id="log">starting loopback capture...</pre>
+</body>
+<script>
+  const BANDS = 32;
+  const log = (msg) => (document.getElementById('log').textContent = msg);
+
+  function bandEnergies(freq, sampleBins) {
+    // Log-spaced buckets: linear FFT bins give almost everything to the highs,
+    // which makes spectrum bars look dead. This weights them the way ears do.
+    const out = new Array(BANDS);
+    const maxBin = sampleBins;
+    for (let i = 0; i < BANDS; i++) {
+      const lo = Math.floor(Math.pow(maxBin, i / BANDS));
+      const hi = Math.max(lo + 1, Math.floor(Math.pow(maxBin, (i + 1) / BANDS)));
+      let sum = 0;
+      for (let b = lo; b < hi && b < maxBin; b++) sum += freq[b];
+      out[i] = sum / Math.max(1, hi - lo) / 255;
+    }
+    return out;
+  }
+
+  function average(arr, from, to) {
+    let sum = 0;
+    for (let i = from; i < to; i++) sum += arr[i];
+    return sum / Math.max(1, to - from);
+  }
+
+  async function capture() {
+    const stream = await navigator.mediaDevices.getDisplayMedia({
+      video: true,
+      audio: true
+    });
+
+    // We only ever wanted the audio track; drop the screen capture immediately.
+    for (const track of stream.getVideoTracks()) {
+      track.stop();
+      stream.removeTrack(track);
+    }
+    if (!stream.getAudioTracks().length) throw new Error('no loopback audio track');
+
+    const ctx = new AudioContext();
+    const source = ctx.createMediaStreamSource(stream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 1024;
+    analyser.smoothingTimeConstant = 0.78;
+    source.connect(analyser);
+
+    const freq = new Uint8Array(analyser.frequencyBinCount);
+    const time = new Uint8Array(analyser.fftSize);
+
+    log('capturing system audio');
+    window.wfAudioBridge.report({ ok: true });
+
+    setInterval(() => {
+      analyser.getByteFrequencyData(freq);
+      analyser.getByteTimeDomainData(time);
+
+      let sumSquares = 0;
+      for (let i = 0; i < time.length; i++) {
+        const v = (time[i] - 128) / 128;
+        sumSquares += v * v;
+      }
+
+      const bands = bandEnergies(freq, analyser.frequencyBinCount);
+      window.wfAudioBridge.send({
+        bands,
+        level: Math.sqrt(sumSquares / time.length),
+        bass: average(bands, 0, 4),
+        mid: average(bands, 4, 16),
+        treble: average(bands, 16, BANDS)
+      });
+    }, 33);
+  }
+
+  capture().catch((err) => {
+    log('audio capture unavailable: ' + err.message);
+    window.wfAudioBridge.report({ ok: false, error: err.message });
+  });
+</script>

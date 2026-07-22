@@ -1,0 +1,15 @@
+{
+  "name": "Constellation",
+  "type": "web",
+  "entry": "index.html",
+  "author": "WallpaperForge",
+  "description": "Drifting particle network that pulses with the beat",
+  "audio": true,
+  "cursor": true,
+  "properties": {
+    "count": 130,
+    "linkDistance": 150,
+    "speed": 1.0,
+    "cursorPull": 1.0
+  }
+}

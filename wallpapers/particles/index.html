@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Constellation</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: #05070e;
+      }
+      canvas {
+        display: block;
+        width: 100%;
+        height: 100%;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="c"></canvas>
+    <script>
+      const canvas = document.getElementById("c");
+      const ctx = canvas.getContext("2d", { alpha: false });
+
+      const props = { count: 130, linkDistance: 150, speed: 1, cursorPull: 1 };
+      const audio = { bass: 0, mid: 0, treble: 0, level: 0 };
+      const cursor = { x: 0.5, y: 0.5, px: 0, py: 0 };
+
+      let particles = [];
+      let width = 0;
+      let height = 0;
+      let dpr = 1;
+      let running = true;
+      let last = performance.now();
+
+      function resize() {
+        dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+        width = window.innerWidth;
+        height = window.innerHeight;
+        canvas.width = Math.round(width * dpr);
+        canvas.height = Math.round(height * dpr);
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      }
+
+      function seed() {
+        // Scale the particle count with screen area so a 4K monitor does not
+        // look sparse and a laptop panel does not look like soup.
+        const target = Math.round(props.count * Math.sqrt((width * height) / (1920 * 1080)));
+        particles = Array.from({ length: Math.max(30, target) }, () => ({
+          x: Math.random() * width,
+          y: Math.random() * height,
+          vx: (Math.random() - 0.5) * 22,
+          vy: (Math.random() - 0.5) * 22,
+          r: 0.7 + Math.random() * 1.7,
+          hue: 185 + Math.random() * 85
+        }));
+      }
+
+      function step(dt) {
+        const pull = props.cursorPull;
+        cursor.px = cursor.x * width;
+        cursor.py = cursor.y * height;
+
+        for (const p of particles) {
+          // Cursor exerts a soft attraction inside a radius, then falls off.
+          const dx = cursor.px - p.x;
+          const dy = cursor.py - p.y;
+          const dist2 = dx * dx + dy * dy;
+          if (pull > 0 && dist2 < 62500 && dist2 > 1) {
+            const force = (pull * 900) / (dist2 + 900);
+            p.vx += dx * force * dt;
+            p.vy += dy * force * dt;
+          }
+
+          // The beat gives everything a shared outward nudge.
+          p.vx *= 0.995;
+          p.vy *= 0.995;
+          p.x += p.vx * dt * props.speed * (1 + audio.bass * 1.5);
+          p.y += p.vy * dt * props.speed * (1 + audio.bass * 1.5);
+
+          if (p.x < -20) p.x = width + 20;
+          if (p.x > width + 20) p.x = -20;
+          if (p.y < -20) p.y = height + 20;
+          if (p.y > height + 20) p.y = -20;
+        }
+      }
+
+      function draw() {
+        ctx.fillStyle = "#05070e";
+        ctx.fillRect(0, 0, width, height);
+
+        const linkDist = props.linkDistance * (1 + audio.mid * 0.45);
+        const linkDist2 = linkDist * linkDist;
+
+        ctx.lineWidth = 1;
+        for (let i = 0; i < particles.length; i++) {
+          const a = particles[i];
+          for (let j = i + 1; j < particles.length; j++) {
+            const b = particles[j];
+            const dx = a.x - b.x;
+            const dy = a.y - b.y;
+            const d2 = dx * dx + dy * dy;
+            if (d2 > linkDist2) continue;
+            const alpha = (1 - d2 / linkDist2) * 0.5 * (0.55 + audio.level * 1.6);
+            ctx.strokeStyle = `hsla(${(a.hue + b.hue) / 2}, 90%, 68%, ${alpha})`;
+            ctx.beginPath();
+            ctx.moveTo(a.x, a.y);
+            ctx.lineTo(b.x, b.y);
+            ctx.stroke();
+          }
+        }
+
+        ctx.globalCompositeOperation = "lighter";
+        for (const p of particles) {
+          const radius = p.r * (1 + audio.treble * 2.2);
+          const glow = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, radius * 6);
+          glow.addColorStop(0, `hsla(${p.hue}, 95%, 75%, 0.9)`);
+          glow.addColorStop(1, `hsla(${p.hue}, 95%, 60%, 0)`);
+          ctx.fillStyle = glow;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, radius * 6, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        ctx.globalCompositeOperation = "source-over";
+      }
+
+      function frame(now) {
+        if (!running) return;
+        const dt = Math.min(0.05, (now - last) / 1000);
+        last = now;
+
+        const data = window.wallpaperForge ? window.wallpaperForge.frame() : null;
+        if (data) {
+          const a = data.audio || {};
+          audio.bass += ((a.bass || 0) - audio.bass) * 0.2;
+          audio.mid += ((a.mid || 0) - audio.mid) * 0.15;
+          audio.treble += ((a.treble || 0) - audio.treble) * 0.25;
+          audio.level += ((a.level || 0) - audio.level) * 0.2;
+          if (data.cursor) {
+            cursor.x += (data.cursor.x - cursor.x) * 0.12;
+            cursor.y += (data.cursor.y - cursor.y) * 0.12;
+          }
+        }
+
+        step(dt);
+        draw();
+        requestAnimationFrame(frame);
+      }
+
+      window.addEventListener("resize", () => {
+        resize();
+        seed();
+      });
+
+      async function boot() {
+        if (window.wallpaperForge) {
+          const config = await window.wallpaperForge.getConfig();
+          Object.assign(props, (config && config.wallpaper && config.wallpaper.properties) || {});
+          window.wallpaperForge.onPause((paused) => {
+            running = !paused;
+            if (running) {
+              last = performance.now();
+              requestAnimationFrame(frame);
+            }
+          });
+        }
+        resize();
+        seed();
+        requestAnimationFrame(frame);
+      }
+
+      boot();
+    </script>
+  </body>
+</html>
