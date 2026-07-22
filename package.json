@@ -10,6 +10,7 @@
     "shortcuts": "electron tools/install-shortcuts.js",
     "living": "electron tools/living.js",
     "preview": "electron tools/preview.js",
+    "outpaint": "electron tools/outpaint.js",
     "postinstall": "node tools/make-icon.js"
   },
   "author": "RMamujee",
