@@ -24,6 +24,11 @@ app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
 app.commandLine.appendSwitch('disable-renderer-backgrounding');
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 
+// Without an explicit AppUserModelID, Windows groups the app under "Electron"
+// in the taskbar and refuses to associate the Start-menu shortcut with it.
+// Must match the ID stamped on the .lnk files by tools/install-shortcuts.js.
+app.setAppUserModelId('com.rmamujee.wallpaperforge');
+
 protocolServer.registerScheme();
 
 if (!app.requestSingleInstanceLock()) {
@@ -48,9 +53,9 @@ function bootstrap() {
     args: ['--hidden']
   });
 
-  const startedHidden = process.argv.includes('--hidden');
-  const hasAssignments = Object.keys(config.get('assignments')).length > 0;
-  if (!startedHidden && !hasAssignments) picker.open();
+  // Launching from the desktop/Start-menu icon should show the library. Only
+  // the autostart entry passes --hidden, so login stays silent.
+  if (!process.argv.includes('--hidden')) picker.open();
 
   console.log(
     `[WallpaperForge] ready - desktop host: ${desktop.hostInfo().kind}, ${library.scan().length} wallpapers in library`
@@ -76,6 +81,19 @@ function applySettings(patch) {
   return config.load();
 }
 
+/**
+ * Thumbnails are written after import (video poster capture), so the URL has to
+ * change when the file does or the picker keeps showing the cached miss.
+ */
+function previewUrl(file) {
+  if (!file) return null;
+  try {
+    return `${library.mediaUrl(file)}?v=${Math.round(fs.statSync(file).mtimeMs)}`;
+  } catch {
+    return null;
+  }
+}
+
 function libraryForUi() {
   return library.scan().map((wallpaper) => ({
     id: wallpaper.id,
@@ -84,7 +102,7 @@ function libraryForUi() {
     author: wallpaper.author,
     description: wallpaper.description,
     builtin: wallpaper.builtin,
-    preview: wallpaper.preview && fs.existsSync(wallpaper.preview) ? library.mediaUrl(wallpaper.preview) : null
+    preview: previewUrl(wallpaper.preview)
   }));
 }
 
@@ -123,25 +141,51 @@ function registerIpc() {
     return uiState();
   });
 
+  const IMPORT_DIALOGS = {
+    video: {
+      title: 'Choose a video to save as a wallpaper',
+      properties: ['openFile'],
+      filters: [{ name: 'Video', extensions: [...library.VIDEO_EXT].map((e) => e.slice(1)) }]
+    },
+    image: {
+      title: 'Choose an image to save as a wallpaper',
+      properties: ['openFile'],
+      filters: [{ name: 'Image', extensions: [...library.IMAGE_EXT].map((e) => e.slice(1)) }]
+    },
+    folder: { title: 'Choose a folder of images', properties: ['openDirectory'] }
+  };
+
   ipcMain.handle('wf:ui-import', async (_event, kind) => {
-    const options =
-      kind === 'video'
-        ? {
-            title: 'Choose a video to use as a wallpaper',
-            properties: ['openFile'],
-            filters: [{ name: 'Video', extensions: ['mp4', 'webm', 'mkv', 'm4v', 'mov'] }]
-          }
-        : { title: 'Choose a folder of images', properties: ['openDirectory'] };
+    const options = IMPORT_DIALOGS[kind] || IMPORT_DIALOGS.folder;
 
     const result = await dialog.showOpenDialog(picker.window() || undefined, options);
     if (result.canceled || !result.filePaths.length) return uiState();
 
+    let importedId = null;
     try {
-      library.importSource(kind, result.filePaths[0]);
+      importedId = await library.importSource(kind, result.filePaths[0]);
     } catch (err) {
-      dialog.showErrorBox('Import failed', err.message);
+      dialog.showErrorBox('Could not save wallpaper', err.message);
     }
+
+    // Videos have no thumbnail until we grab a frame. The picker does the decode
+    // (a normal GPU-backed renderer) and hands the JPEG back via `wf:ui-poster`.
+    if (importedId) {
+      const wallpaper = library.byId(importedId);
+      const resolved = wallpaper && library.resolveForRender(wallpaper);
+      if (resolved && wallpaper.type === 'video' && resolved.payload.source) {
+        const window = picker.window();
+        if (window) window.webContents.send('wf:make-poster', { id: importedId, url: resolved.payload.source });
+      }
+    }
+
     tray.rebuild();
+    return uiState();
+  });
+
+  ipcMain.handle('wf:ui-poster', (_event, { id, dataUrl }) => {
+    const base64 = String(dataUrl || '').split(',')[1];
+    if (base64) library.setPreview(id, Buffer.from(base64, 'base64'));
     return uiState();
   });
 

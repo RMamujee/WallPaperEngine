@@ -9,13 +9,18 @@
  *     "name": "Nebula Flow",
  *     "type": "web" | "video" | "slideshow",
  *     "entry": "index.html",         // web only
- *     "source": "C:/clips/loop.mp4", // video only (abs path or relative to the folder)
- *     "folder": "images",            // slideshow only
- *     "preview": "preview.png",
+ *     "source": "media/loop.mp4",    // video only (abs path or relative to the folder)
+ *     "folder": "media",             // slideshow only
+ *     "preview": "preview.jpg",
  *     "audio": true,                 // wants audio spectrum data
  *     "cursor": true,                // wants cursor position
  *     "properties": { ... }          // free-form, handed to the wallpaper
  *   }
+ *
+ * Imported wallpapers own their media: the picked video/images are COPIED into
+ * the wallpaper's own `media/` folder and the manifest points at that copy with
+ * a relative path. Deleting or moving the file you originally picked therefore
+ * can't break a saved wallpaper.
  */
 
 const fs = require('fs');
@@ -150,31 +155,126 @@ function resolveForRender(wallpaper) {
   };
 }
 
-/** Create a user wallpaper folder from a picked video file or image folder. */
-function importSource(kind, sourcePath) {
-  const root = userRoot();
-  fs.mkdirSync(root, { recursive: true });
-  const label = path.basename(sourcePath, kind === 'video' ? path.extname(sourcePath) : '');
-  const slug =
+function slugify(label) {
+  return (
     label
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, '-')
-      .replace(/^-|-$/g, '') || 'imported';
+      .replace(/^-|-$/g, '') || 'imported'
+  );
+}
 
+/** Strip anything Windows won't accept in a filename, keeping the extension. */
+function safeFileName(name) {
+  const cleaned = name.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').replace(/^\.+/, '');
+  return cleaned || 'file';
+}
+
+/** Reserve an unused directory under the user library for `slug`. */
+function reserveDir(root, slug) {
   let dirName = slug;
   let n = 2;
   while (fs.existsSync(path.join(root, dirName))) dirName = `${slug}-${n++}`;
+  return { dirName, dir: path.join(root, dirName) };
+}
 
-  const dir = path.join(root, dirName);
-  fs.mkdirSync(dir, { recursive: true });
+/**
+ * Copy `files` into `destDir`, de-duplicating names so two sources that happen
+ * to share a basename don't overwrite each other. Returns the new basenames in
+ * the same order.
+ */
+async function copyAll(files, destDir, onProgress) {
+  const used = new Set();
+  const names = [];
 
-  const manifest =
-    kind === 'video'
-      ? { name: label, type: 'video', source: sourcePath, audio: false, cursor: false }
-      : { name: label, type: 'slideshow', folder: sourcePath, audio: false, cursor: false };
+  for (let i = 0; i < files.length; i++) {
+    const ext = path.extname(files[i]);
+    const stem = safeFileName(path.basename(files[i], ext));
+    let name = `${stem}${ext}`;
+    let n = 2;
+    while (used.has(name.toLowerCase())) name = `${stem}-${n++}${ext}`;
+    used.add(name.toLowerCase());
 
-  fs.writeFileSync(path.join(dir, 'wallpaper.json'), JSON.stringify(manifest, null, 2));
+    await fs.promises.copyFile(files[i], path.join(destDir, name));
+    names.push(name);
+    if (onProgress) onProgress(i + 1, files.length);
+  }
+  return names;
+}
+
+/**
+ * Create a user wallpaper from a picked video, single image, or image folder.
+ * The media is copied into the new wallpaper's `media/` folder so the saved
+ * wallpaper no longer depends on wherever the file came from.
+ *
+ * Async and non-blocking: a multi-gigabyte video must not freeze the desktop.
+ */
+async function importSource(kind, sourcePath, onProgress) {
+  const root = userRoot();
+  await fs.promises.mkdir(root, { recursive: true });
+
+  const isFolder = kind === 'folder';
+  const label = isFolder
+    ? path.basename(sourcePath)
+    : path.basename(sourcePath, path.extname(sourcePath));
+
+  const { dirName, dir } = reserveDir(root, slugify(label));
+  const mediaDir = path.join(dir, 'media');
+  await fs.promises.mkdir(mediaDir, { recursive: true });
+
+  let manifest;
+  try {
+    if (kind === 'video') {
+      const [name] = await copyAll([sourcePath], mediaDir, onProgress);
+      manifest = {
+        name: label,
+        type: 'video',
+        source: `media/${name}`,
+        audio: false,
+        cursor: false
+      };
+    } else {
+      const images = isFolder ? listImages(sourcePath) : [sourcePath];
+      if (!images.length) throw new Error(`No images found in ${sourcePath}`);
+
+      const names = await copyAll(images, mediaDir, onProgress);
+      manifest = {
+        name: label,
+        type: 'slideshow',
+        folder: 'media',
+        // The first frame is a free, always-correct thumbnail.
+        preview: `media/${names[0]}`,
+        audio: false,
+        cursor: false
+      };
+    }
+  } catch (err) {
+    // Never leave a half-copied wallpaper in the library.
+    fs.rmSync(dir, { recursive: true, force: true });
+    throw err;
+  }
+
+  await fs.promises.writeFile(path.join(dir, 'wallpaper.json'), JSON.stringify(manifest, null, 2));
   return `user:${dirName}`;
+}
+
+/**
+ * Attach a thumbnail to a saved wallpaper. `buffer` is raw JPEG bytes captured
+ * from the renderer (see `wf:ui-poster`); best effort, never fatal.
+ */
+function setPreview(id, buffer) {
+  const wp = byId(id);
+  if (!wp || wp.builtin) return false;
+  try {
+    fs.writeFileSync(path.join(wp.dir, 'preview.jpg'), buffer);
+    const manifest = readManifest(wp.dir) || {};
+    manifest.preview = 'preview.jpg';
+    fs.writeFileSync(path.join(wp.dir, 'wallpaper.json'), JSON.stringify(manifest, null, 2));
+    return true;
+  } catch (err) {
+    console.error('[library] preview save failed:', err.message);
+    return false;
+  }
 }
 
 function remove(id) {
@@ -189,6 +289,7 @@ module.exports = {
   byId,
   resolveForRender,
   importSource,
+  setPreview,
   remove,
   builtinRoot,
   userRoot,

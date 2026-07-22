@@ -175,6 +175,17 @@
       button.action:hover {
         border-color: #34405c;
       }
+      button.action:disabled {
+        opacity: 0.55;
+        cursor: default;
+        border-color: var(--line);
+      }
+      .note {
+        color: var(--muted);
+        font-size: 11px;
+        line-height: 1.45;
+        margin: 2px 0 0;
+      }
 
       main {
         display: flex;
@@ -336,8 +347,10 @@
 
         <h2>Add</h2>
         <button class="action" id="add-video">+ Video file (mp4 / webm)</button>
+        <button class="action" id="add-image">+ Image</button>
         <button class="action" id="add-folder">+ Image folder (slideshow)</button>
         <button class="action" id="open-folder">Open wallpapers folder</button>
+        <p class="note">Anything you add is copied into your library, so it keeps working even if you move or delete the original file.</p>
 
         <h2>Behaviour</h2>
         <label class="row">
@@ -526,14 +539,83 @@
         }, 120);
       };
 
-      $("add-video").onclick = async () => {
-        state = await window.forge.import("video");
+      const ADD_BUTTONS = ["add-video", "add-image", "add-folder"];
+
+      // Copying a multi-gigabyte video takes a while. Keep the button honest and
+      // stop a second import from racing the first.
+      async function runImport(id, kind) {
+        const button = $(id);
+        const label = button.textContent;
+        for (const other of ADD_BUTTONS) $(other).disabled = true;
+        button.textContent = "Saving to library…";
+        try {
+          state = await window.forge.import(kind);
+          render();
+        } finally {
+          button.textContent = label;
+          for (const other of ADD_BUTTONS) $(other).disabled = false;
+        }
+      }
+
+      $("add-video").onclick = () => runImport("add-video", "video");
+      $("add-image").onclick = () => runImport("add-image", "image");
+      $("add-folder").onclick = () => runImport("add-folder", "folder");
+
+      /**
+       * Decode one frame of a saved video so its library card has a real
+       * thumbnail. Best effort — a failure just leaves the gradient placeholder.
+       */
+      function captureFrame(url) {
+        return new Promise((resolve) => {
+          const video = document.createElement("video");
+          video.crossOrigin = "anonymous";
+          video.muted = true;
+          video.preload = "auto";
+
+          let settled = false;
+          const finish = (value) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            video.removeAttribute("src");
+            video.load();
+            resolve(value);
+          };
+          const timer = setTimeout(() => finish(null), 15000);
+
+          const draw = () => {
+            try {
+              const ratio = video.videoHeight / video.videoWidth;
+              const width = 640;
+              const height = Math.max(1, Math.round(width * (ratio || 0.5625)));
+              const canvas = document.createElement("canvas");
+              canvas.width = width;
+              canvas.height = height;
+              canvas.getContext("2d").drawImage(video, 0, 0, width, height);
+              finish(canvas.toDataURL("image/jpeg", 0.82));
+            } catch {
+              finish(null);
+            }
+          };
+
+          video.onloadeddata = () => {
+            // Frame 0 is black in a lot of clips; step in a little.
+            const at = Math.min(1.5, (video.duration || 3) * 0.1);
+            if (Number.isFinite(at) && at > 0) video.currentTime = at;
+            else draw();
+          };
+          video.onseeked = draw;
+          video.onerror = () => finish(null);
+          video.src = url;
+        });
+      }
+
+      window.forge.onMakePoster(async ({ id, url }) => {
+        const dataUrl = await captureFrame(url);
+        if (!dataUrl) return;
+        state = await window.forge.poster(id, dataUrl);
         render();
-      };
-      $("add-folder").onclick = async () => {
-        state = await window.forge.import("folder");
-        render();
-      };
+      });
       $("open-folder").onclick = () => window.forge.openFolder();
       $("reload").onclick = async () => {
         state = await window.forge.reload();

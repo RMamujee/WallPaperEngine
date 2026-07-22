@@ -19,6 +19,12 @@ const library = require('./library');
 
 const SCHEME = 'wf';
 
+// wf://builtin, wf://wallpaper and wf://media are separate origins, so pulling a
+// video frame onto a canvas in the picker would taint it without these. Every
+// wf:// URL resolves to a local file this app already chose to serve, so there
+// is nothing to withhold from a sibling wf:// page.
+const CORS = { 'access-control-allow-origin': '*' };
+
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -105,7 +111,8 @@ function serveFile(filePath, request) {
           'content-type': type,
           'content-length': String(last - start + 1),
           'content-range': `bytes ${start}-${last}/${stat.size}`,
-          'accept-ranges': 'bytes'
+          'accept-ranges': 'bytes',
+          ...CORS
         }
       });
     }
@@ -117,7 +124,8 @@ function serveFile(filePath, request) {
       'content-type': type,
       'content-length': String(stat.size),
       'accept-ranges': 'bytes',
-      'cache-control': 'no-cache'
+      'cache-control': 'no-cache',
+      ...CORS
     }
   });
 }
