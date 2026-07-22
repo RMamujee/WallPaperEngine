@@ -37,6 +37,8 @@
         border-right: 1px solid var(--line);
         padding: 20px 18px;
         overflow-y: auto;
+        overscroll-behavior: contain;
+        min-height: 0;
       }
       .brand {
         display: flex;
@@ -191,6 +193,11 @@
         display: flex;
         flex-direction: column;
         min-width: 0;
+        /* A flex item defaults to min-height:auto, which refuses to shrink below
+           its content. Without this the grid grows past the window instead of
+           scrolling, and body's overflow:hidden silently clips the extra rows -
+           they are simply unreachable. */
+        min-height: 0;
       }
       header {
         display: flex;
@@ -234,12 +241,37 @@
 
       .grid {
         flex: 1;
+        min-height: 0;
         overflow-y: auto;
+        overscroll-behavior: contain;
         padding: 22px 24px 40px;
         display: grid;
         grid-template-columns: repeat(auto-fill, minmax(226px, 1fr));
         gap: 16px;
         align-content: start;
+      }
+
+      /* Chromium hides the scrollbar until you scroll, so on a dark panel there
+         is nothing to tell you the list continues below the fold. */
+      .grid::-webkit-scrollbar,
+      aside::-webkit-scrollbar {
+        width: 11px;
+      }
+      .grid::-webkit-scrollbar-track,
+      aside::-webkit-scrollbar-track {
+        background: transparent;
+      }
+      .grid::-webkit-scrollbar-thumb,
+      aside::-webkit-scrollbar-thumb {
+        background: #2b3348;
+        border-radius: 999px;
+        border: 3px solid transparent;
+        background-clip: content-box;
+      }
+      .grid::-webkit-scrollbar-thumb:hover,
+      aside::-webkit-scrollbar-thumb:hover {
+        background: #3d4864;
+        background-clip: content-box;
       }
 
       .card {

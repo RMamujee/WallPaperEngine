@@ -18,6 +18,23 @@ let manualPause = false;
 let sessionLocked = false;
 let lastReason = 'running';
 
+// How long a display must stay covered before its wallpaper is hidden.
+//
+// Hiding is only free when something really is covering the screen. A screen
+// snip (Win+Shift+S) puts up a fullscreen transparent overlay that is
+// indistinguishable from a game by rect alone, so the wallpaper was being
+// hidden for the exact moment the shot was taken - and the capture recorded
+// the static Windows wallpaper underneath instead of this one.
+//
+// A game holds the screen for minutes; a snip overlay lives for a couple of
+// seconds. Waiting this long before hiding costs a game nothing and makes the
+// overlay case disappear, without having to enumerate every capture tool's
+// window class.
+const COVER_HOLD_MS = 3000;
+
+// displayId -> timestamp when it was first seen covered
+const coveredSince = new Map();
+
 // DIP-to-physical conversion rounds (a 2560x1600 panel reports as 2561x1601),
 // so an exactly-fullscreen window can fall a pixel short of covering it.
 // A maximised window stops ~a taskbar short, far outside this tolerance.
@@ -48,15 +65,23 @@ function evaluate() {
   if (config.get('pauseOnBattery') && powerMonitor.onBatteryPower) return apply(true, 'on battery');
   if (!config.get('pauseOnFullscreen')) return apply(false, 'running');
 
+  // Uncovering takes effect immediately; covering has to persist. See
+  // COVER_HOLD_MS - this is what stops a screen snip blanking the wallpaper.
+  const now = Date.now();
   const covered = coveredDisplayIds();
+  for (const id of coveredSince.keys()) if (!covered.includes(id)) coveredSince.delete(id);
+  for (const id of covered) if (!coveredSince.has(id)) coveredSince.set(id, now);
+
+  const settled = covered.filter((id) => now - coveredSince.get(id) >= COVER_HOLD_MS);
+
   if (config.get('pauseScope') === 'all') {
-    return apply(covered.length > 0, covered.length ? 'fullscreen app' : 'running');
+    return apply(settled.length > 0, settled.length ? 'fullscreen app' : 'running');
   }
 
   for (const display of screen.getAllDisplays()) {
-    desktop.setPaused(display.id, covered.includes(display.id));
+    desktop.setPaused(display.id, settled.includes(display.id));
   }
-  lastReason = covered.length ? 'fullscreen app (per monitor)' : 'running';
+  lastReason = settled.length ? 'fullscreen app (per monitor)' : 'running';
 }
 
 function apply(paused, reason) {
