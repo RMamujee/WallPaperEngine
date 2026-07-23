@@ -16,6 +16,25 @@
     height: 100%;
     display: block;
   }
+  /*
+   * The overlay carries nothing but light sources, and a light must never darken
+   * what is behind it. Painted with plain alpha it does exactly that: alpha drags
+   * the background toward the lamp's colour, which works over the dark towers and
+   * inverts over the sunset, where the far tower's roofline sits against sky
+   * brighter than any red. Measured, that beacon got *darker* as it brightened.
+   *
+   * Screen, not lighten. Per-channel max looks like the better answer - it would
+   * keep the lamp red instead of washing it toward white - but it does nothing at
+   * all here, because the sky the far tower stands against is saturated orange
+   * and already pegs the red channel at full. Screen is the one that lifts a
+   * backdrop that is already bright in the channel the lamp is strongest in.
+   *
+   * The aircraft barely notice: over the dark upper sky screen and source-over
+   * agree to within a couple of levels for a near-white sprite.
+   */
+  #fx {
+    mix-blend-mode: screen;
+  }
   #error {
     position: fixed;
     inset: 0;
@@ -455,6 +474,12 @@
    * Find, for every column of the plate, the first row that is real geometry
    * rather than sky, and pack two versions of that line into an RGBA row.
    *
+   * Returns both the packed texture and the cleaned per-column line it was built
+   * from. The texture is all the shader needs, but the beacon placement below has
+   * to reason about the skyline as a shape - where its peaks are and how far each
+   * one stands above its neighbours - and a byte-quantised texture is the wrong
+   * thing to measure that on.
+   *
    * Absolute brightness cannot do this. Measured off this plate, the dark cloud
    * bands sit at luminance 0.44-0.48 and so does the volcano; the distant ridges
    * are *brighter* than both at 0.51-0.59. Any fixed threshold either eats the
@@ -568,18 +593,198 @@
       data[i * 4 + 2] = 0;
       data[i * 4 + 3] = 255;
     }
-    return data;
+    return { data, line };
+  }
+
+  /** JS twin of the shader's hash21, so both sides randomise the same way. */
+  function hash21(x, y) {
+    const fract = (v) => v - Math.floor(v);
+    let px = fract(x * 123.34);
+    let py = fract(y * 456.21);
+    const d = px * (px + 45.32) + py * (py + 45.32);
+    px += d;
+    py += d;
+    return fract(px * py);
   }
 
   /**
-   * Aircraft lights on a 2D overlay. Two pixels of steady white with a red
-   * beacon is all an airliner is from this far away, and a sprite is far easier
-   * to keep crisp than the equivalent signed-distance work in the shader.
+   * Pick the towers that would carry aircraft obstruction beacons.
    *
-   * They are confined to the top of the sky rather than depth-sorted against the
-   * skyline, because everything above 0.13 in this frame is empty air.
+   * Every structure in Tokyo above 60m carries slow red warning lights, so this
+   * is the one blinking light a skyline is actually *supposed* to have; it lands
+   * on the two or three buildings a viewer already reads as the tall ones, which
+   * is what keeps it from looking like decoration scattered over the plate.
+   *
+   * Which means the tall ones have to be found, not typed in. The measure is
+   * topographic prominence on the skyline returned above: how far a peak stands
+   * above the highest saddle joining it to anything taller. A plain "lower than
+   * both neighbours" test does not work - the widest tower here is 68 columns of
+   * roof furniture and would collect a dozen beacons along one roofline, which is
+   * exactly the scattered look to avoid - while prominence answers the real
+   * question, "is this a separate building or a bump on one I already have".
+   *
+   * Prominence alone is still not enough, because the tallest thing in the frame
+   * after the two towers is Mount Fuji, at prominence 0.047 against the near
+   * tower's 0.213 and the far tower's 0.100 - close enough that a threshold is
+   * the only thing keeping a red aircraft light off a volcano, and a threshold is
+   * exactly what someone retuning this file will move. What separates them
+   * categorically is not height but edge: a facade is a cliff and a mountainside
+   * is a slope. Measured on this plate, the drop off a roof edge is 0.2 inside
+   * eight columns, where Fuji's flank manages 0.01 over the same distance. So a
+   * candidate must also deliver a fall of `cliff` on BOTH sides with at least
+   * that much of it inside a single `stride`. Sweeping that threshold, Fuji drops
+   * out between 0.005 and 0.010 while the far tower survives to 0.06 and the near
+   * one past 0.14, so the shipped 0.025 sits mid-plateau with roughly 2.5x of
+   * clearance either way - and, more to the point, on the correct side of a
+   * distinction that is about shape rather than about where the dial is set.
+   *
+   * Peaks are then taken strongest first with a minimum separation, so two
+   * beacons can never crowd the same roof.
+   *
+   * Note what this finds on THIS plate: exactly two. The horizon across most of
+   * the frame is the mountain ridge, not the city, so the mid-height towers never
+   * break it and score prominence 0.006-0.013, down in the noise of the general
+   * roofline. `beacons` is a limit, not a quota - raising it will not invent a
+   * third tower, and the thresholds are the wrong thing to lower to get one.
    */
-  function createOverlay(canvas, props, num) {
+  function findBeacons(line, opt) {
+    const n = line.length;
+    const stride = Math.max(1, Math.round(opt.stride * n));
+    const span = Math.max(stride + 1, Math.round(opt.span * n));
+    const gap = Math.max(1, Math.round(opt.gap * n));
+
+    // Plateau-aware peaks. Roofs are flat and the median filter quantises them,
+    // so runs of exactly equal columns are the normal case, not the exception;
+    // each run contributes its centre once.
+    const peaks = [];
+    for (let x = 0; x < n; x++) {
+      let end = x;
+      while (end + 1 < n && line[end + 1] === line[x]) end++;
+      const risesLeft = x === 0 || line[x - 1] > line[x];
+      const fallsRight = end === n - 1 || line[end + 1] > line[end];
+      if (risesLeft && fallsRight) peaks.push((x + end) >> 1);
+      x = end;
+    }
+
+    // Walk out both ways to the first genuinely taller column, keeping the
+    // lowest point crossed on the way. The shallower of the two descents is the
+    // key saddle; a direction that reaches the frame edge without finding
+    // anything taller simply reports its own lowest point, which is the standard
+    // treatment for a peak with nothing above it.
+    const prominenceOf = (p) => {
+      let left = line[p];
+      let right = line[p];
+      for (let i = p - 1; i >= 0 && line[i] >= line[p]; i--) left = Math.max(left, line[i]);
+      for (let i = p + 1; i < n && line[i] >= line[p]; i++) right = Math.max(right, line[i]);
+      return Math.min(left, right) - line[p];
+    };
+
+    // Walk outward until the skyline has fallen `cliff` below the peak, keeping
+    // the sharpest single stride crossed on the way. The walk has to run until
+    // the fall is achieved rather than over a fixed window: the near tower's roof
+    // is 70 columns wide and breaks into two peaks either side of its rooftop
+    // clutter, so a window centred on the peak sees one facade and 50 columns of
+    // flat roof, scores the flat side at zero, and rejects the tallest building
+    // in the frame.
+    const steepestOf = (p, dir) => {
+      let steepest = 0;
+      for (let k = 0; k < span; k++) {
+        const i = p + dir * k;
+        const j = i + dir * stride;
+        if (j < 0 || j >= n || line[j] < line[p]) break;
+        steepest = Math.max(steepest, line[j] - line[i]);
+        if (line[j] - line[p] >= opt.cliff) break;
+      }
+      return steepest;
+    };
+    const cliffOf = (p) => Math.min(steepestOf(p, -1), steepestOf(p, 1));
+
+    // Sit the mark on the middle of the roof rather than on the raw peak column,
+    // which on a wide roof is off beside the parapet. The run of columns at the
+    // roof's own height is the honest centre and is also where a tower carries
+    // its beacon. The tolerance is two rows of the scan, not an aesthetic choice:
+    // it exists so quantisation cannot split a flat roof in half.
+    const snap = 2 / SKY_SCAN_H;
+    const roofCentre = (p) => {
+      let left = p;
+      let right = p;
+      while (left > 0 && p - left < span && line[left - 1] <= line[p] + snap) left--;
+      while (right < n - 1 && right - p < span && line[right + 1] <= line[p] + snap) right++;
+      return (left + right) >> 1;
+    };
+
+    const scored = peaks
+      .filter((p) => line[p] <= opt.ceiling)
+      .map((p) => ({ x: p, y: line[p], prominence: prominenceOf(p), cliff: cliffOf(p) }))
+      .filter((c) => c.prominence >= opt.prominence && c.cliff >= opt.cliff)
+      .sort((a, b) => b.prominence - a.prominence || a.y - b.y);
+
+    const picked = [];
+    for (const candidate of scored) {
+      if (picked.length >= opt.count) break;
+      if (picked.some((other) => Math.abs(other.x - candidate.x) < gap)) continue;
+      picked.push(candidate);
+    }
+
+    // These towers are all roughly the same real height, so the one that takes
+    // up the most frame is simply the nearest - which makes prominence a usable
+    // stand-in for depth. Beacons further back come out smaller and dimmer, the
+    // same way the painting already thins everything behind the front rank.
+    // Square-rooted because prominence is an area-ish measure and the raw ratio
+    // overstates the gap: the near tower scores twice the far one, which as a
+    // straight multiplier reads as a lighting error rather than as distance.
+    //
+    // Be clear about how much this is doing on this plate: with two towers it
+    // works out to about 11%, which is a nudge, not the reason the far beacon
+    // looks further away. That comes from the backdrop - it stands against a lit
+    // sky and the near one against dark glass, and the sky costs it far more than
+    // this multiplier ever will. The term earns its place for the retune case,
+    // where a beacon on a genuinely distant tower would otherwise arrive at
+    // exactly the same weight as one on the front rank.
+    const strongest = picked.length ? picked[0].prominence : 1;
+    return picked.map((c) => {
+      const col = roofCentre(c.x);
+      return {
+        u: (col + 0.5) / n,
+        // Seated slightly *below* the measured line, not above it. The scan
+        // returns the first row that is not sky, at a resolution of one row in
+        // SKY_SCAN_H, so the line it reports sits up to a couple of rows proud of
+        // the actual deck - and a lamp placed above that is a lamp hanging in mid
+        // air. Rendered, the difference was stark: floated, the far tower's
+        // beacon washed out against the sunset behind it and vanished, while
+        // seated on the roof it has the dark deck to stand against and reads at
+        // full size. The halo is several times this offset, so the light still
+        // spills well above the roofline rather than being buried in it.
+        v: Math.max(0, c.y + opt.seat),
+        weight: 1 - opt.depth * (1 - Math.sqrt(Math.min(1, c.prominence / strongest))),
+        // Seeded off the column, so a given plate always produces the same
+        // phases and no two beacons ever pulse in step.
+        phase: hash21(col * 0.617 + 3.11, 7.13),
+        // What this peak scored, kept for the same reason the shader keeps its
+        // mask debug modes: a mis-detection here renders as a perfectly plausible
+        // light on the wrong roof, and the only way to tell is to read the
+        // numbers that chose it.
+        metrics: Object.assign({ col }, c)
+      };
+    });
+  }
+
+  /**
+   * Point lights on a 2D overlay: the aircraft crossing the high sky, and the
+   * obstruction beacons standing on the towers.
+   *
+   * Two pixels of steady white with a red beacon is all an airliner is from this
+   * far away, and a sprite is far easier to keep crisp than the equivalent
+   * signed-distance work in the shader. They are confined to the top of the sky
+   * rather than depth-sorted against the skyline, because everything above 0.13
+   * in this frame is empty air.
+   *
+   * The tower beacons are here for the same reason and one more: this plate is a
+   * painting with real haze in it, so a soft radial falloff is the correct shape
+   * for a lamp seen through that air, and a canvas gradient gives that for free
+   * where the shader would need another mask.
+   */
+  function createOverlay(canvas, props, num, scene) {
     const ctx = canvas.getContext('2d');
     const count = Math.max(0, Math.round(num(props.aircraft, 2)));
     const speed = num(props.aircraftSpeed, 1);
@@ -587,8 +792,32 @@
     const top = num(band[0], 0.05);
     const bottom = num(band[1], 0.12);
 
+    const beacons = scene.beacons;
+    const imageAspect = scene.imageAspect;
+    const focus = scene.focus;
+    const beaconPeriod = Math.max(0.5, num(props.beaconPeriod, 4.4));
+    const beaconSize = Math.max(0, num(props.beaconSize, 0.0072));
+    const beaconGlow = Math.max(0, num(props.beaconGlow, 1));
+    const beaconFloor = clamp01(num(props.beaconFloor, 0.16));
+
+    const tint = Array.isArray(props.beaconColor) ? props.beaconColor : [255, 92, 74];
+    const channel = (v, fallback) => Math.round(Math.min(255, Math.max(0, num(v, fallback))));
+    const lamp = [channel(tint[0], 255), channel(tint[1], 92), channel(tint[2], 74)];
+    // The filament, not the glass: a hotter centre inside the halo, which is what
+    // stops a small lamp reading as a smudge. Only slightly hotter, though. Under
+    // the screen blend above, a backdrop this bright supplies most of the result
+    // on its own, so a core mixed far toward white lands on white and the beacon
+    // stops looking like a red light at all.
+    const core = [
+      Math.round(lamp[0] + (255 - lamp[0]) * 0.15),
+      Math.round(lamp[1] + (222 - lamp[1]) * 0.15),
+      Math.round(lamp[2] + (198 - lamp[2]) * 0.15)
+    ];
+    const rgba = (c, a) => `rgba(${c[0]}, ${c[1]}, ${c[2]}, ${a.toFixed(3)})`;
+
     let width = 1;
     let height = 1;
+    let clock = 0;
 
     const spawn = (offscreen) => {
       const dir = Math.random() < 0.5 ? 1 : -1;
@@ -613,7 +842,21 @@
       height = h;
     }
 
+    /**
+     * Image UV -> screen pixels: the JS inverse of the shader's coverUv, so a
+     * beacon measured on the plate lands on the same pixel the roof does at any
+     * aspect ratio. Deriving it rather than assuming the plate fills the frame
+     * matters because a 16:9 desktop crops 10% off this 16:10 painting.
+     */
+    function project(u, v) {
+      const screenAspect = width / height;
+      const sx = screenAspect > imageAspect ? 1 : screenAspect / imageAspect;
+      const sy = screenAspect > imageAspect ? imageAspect / screenAspect : 1;
+      return [((u - focus[0]) / sx + 0.5) * width, ((v - focus[1]) / sy + 0.5) * height];
+    }
+
     function update(dt) {
+      clock += dt;
       for (const a of craft) {
         if (a.wait > 0) {
           a.wait -= dt;
@@ -625,8 +868,47 @@
       }
     }
 
+    function drawBeacons() {
+      for (const b of beacons) {
+        const [x, y] = project(b.u, b.v);
+        const reach = height * beaconSize * 3.4 * b.weight;
+        if (x < -reach || x > width + reach || y < -reach || y > height + reach) continue;
+
+        // Slow swell, no edges. A raw sine sits near half brightness for half of
+        // every cycle and reads as a steady lamp with a wobble; smoothstepping it
+        // and then biasing the result dark holds the beacon low most of the time
+        // and lifts it briefly, which is the shape of a real obstruction light.
+        // The one thing it must never be is a square wave - a hard on/off at this
+        // size is a strobe, and this painting has nothing else abrupt in it.
+        const cycle = clock / beaconPeriod + b.phase;
+        const wave = 0.5 - 0.5 * Math.cos((cycle - Math.floor(cycle)) * Math.PI * 2);
+        const pulse = Math.pow(wave * wave * (3 - 2 * wave), 1.9);
+        const level = (beaconFloor + (1 - beaconFloor) * pulse) * b.weight * beaconGlow;
+
+        // The halo grows a little as it brightens. A lamp that only changes
+        // opacity looks like a fading decal; one that also swells looks like more
+        // light getting through the same air.
+        const halo = Math.max(2, height * beaconSize * (0.78 + 0.42 * pulse) * b.weight);
+        const gradient = ctx.createRadialGradient(x, y, 0, x, y, halo);
+        gradient.addColorStop(0, rgba(lamp, Math.min(0.92, level * 0.72)));
+        gradient.addColorStop(0.4, rgba(lamp, Math.min(0.5, level * 0.24)));
+        gradient.addColorStop(1, rgba(lamp, 0));
+        ctx.fillStyle = gradient;
+        ctx.beginPath();
+        ctx.arc(x, y, halo, 0, Math.PI * 2);
+        ctx.fill();
+
+        const bulb = Math.max(0.9, halo * 0.19);
+        ctx.beginPath();
+        ctx.arc(x, y, bulb, 0, Math.PI * 2);
+        ctx.fillStyle = rgba(core, Math.min(0.95, level * 0.9));
+        ctx.fill();
+      }
+    }
+
     function draw() {
       ctx.clearRect(0, 0, width, height);
+      drawBeacons();
       const r = Math.max(1, height * 0.0016);
       for (const a of craft) {
         if (a.wait > 0) continue;
@@ -650,7 +932,7 @@
       }
     }
 
-    return { resize, update, draw, active: count > 0 };
+    return { resize, update, draw, active: count > 0 || beacons.length > 0 };
   }
 
   async function boot() {
@@ -683,6 +965,18 @@
       cityCeiling: num(properties.cityCeiling, 0.15)
     });
 
+    const beacons = findBeacons(skyline.line, {
+      count: Math.max(0, Math.round(num(properties.beacons, 3))),
+      ceiling: num(properties.beaconCeiling, 0.4),
+      prominence: num(properties.beaconProminence, 0.05),
+      cliff: num(properties.beaconCliff, 0.05),
+      span: num(properties.beaconSpan, 0.05),
+      stride: num(properties.beaconStride, 0.008),
+      gap: num(properties.beaconGap, 0.05),
+      seat: num(properties.beaconSeat, 0.004),
+      depth: clamp01(num(properties.beaconDepth, 0.35))
+    });
+
     const program = buildProgram(gl);
     gl.useProgram(program);
 
@@ -706,7 +1000,7 @@
     gl.activeTexture(gl.TEXTURE1);
     const skyTex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, skyTex);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, SKY_TEX_W, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, skyline);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, SKY_TEX_W, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, skyline.data);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
@@ -774,7 +1068,11 @@
     gl.uniform1f(u('uBrightness'), num(properties.brightness, 1));
     gl.uniform1i(u('uDebug'), Math.round(num(properties.debug, 0)));
 
-    const overlay = createOverlay(fxCanvas, properties, num);
+    const overlay = createOverlay(fxCanvas, properties, num, {
+      beacons,
+      imageAspect: image.width / image.height,
+      focus: [num(focus[0], 0.5), num(focus[1], 0.5)]
+    });
 
     function resize() {
       const dpr = Math.min(window.devicePixelRatio || 1, 2);
