@@ -17,12 +17,20 @@
     "stutterJitter": 8,
     "stutterLength": 0.34,
     "failingMachine": -1,
-    "failDepth": 0.42,
+    "failDepth": 0.26,
     "failRate": 1,
     "failBurstEvery": 7.5,
     "failBurstJitter": 4,
     "failBurstLength": 1.35,
-    "floorGain": 0.9,
+    "blinkPeriod": 4.6,
+    "blinkJitter": 2,
+    "blinkDepth": 0.14,
+    "blinkPerMachine": 2,
+    "blinkFeather": [
+      0.002,
+      0.003
+    ],
+    "floorGain": 0.5,
     "floorWobble": 1.8,
     "floorWobbleRate": 1,
     "snowCount": 750,
@@ -60,17 +68,18 @@
       232,
       255
     ],
-    "glassLevels": [
-      0.18,
-      0.4
+    "glassFeather": [
+      0.005,
+      0.008
     ],
-    "floorLevels": [
-      0.16,
-      0.34
+    "tubeFeather": [
+      0.008,
+      0.004
     ],
-    "tubeLevels": [
-      0.24,
-      0.4
+    "floorFeather": 0.02,
+    "bloomLevels": [
+      0.45,
+      0.78
     ]
   }
 }
