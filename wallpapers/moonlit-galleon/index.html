@@ -1,0 +1,616 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>WallpaperForge - moonlit galleon</title>
+<style>
+  html,
+  body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #100d1c;
+  }
+  #gl {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+  #error {
+    position: fixed;
+    inset: 0;
+    display: none;
+    place-content: center;
+    font: 500 15px/1.6 system-ui, sans-serif;
+    color: #9a8fb0;
+    text-align: center;
+    padding: 8vh 10vw;
+  }
+</style>
+<canvas id="gl"></canvas>
+<div id="error"></div>
+
+<script>
+  /**
+   * "Moonlit galleon": a pixel-art tall ship at sea, animated entirely in one
+   * shader. There is no overlay - everything that moves here is already in the
+   * plate, and the whole job is moving it convincingly.
+   *
+   *   - the sea below the horizon wobbles and carries expanding rings, which is
+   *     what makes the moon's path and the ship's reflection live
+   *   - the ship rolls, slowly, about the waterline
+   *   - the moon breathes, and a very slow wave of light travels along the
+   *     cloud bank
+   *
+   * THE PLATE IS PIXEL ART AND MUST NOT BE RESAMPLED. Sampling at a fractional
+   * offset blends two source texels and rounds off exactly the hard blocky
+   * edges the style is made of, so every displacement computed below is snapped
+   * to WHOLE SOURCE TEXELS before it is used. The sea therefore slides in
+   * visible steps, which is correct for the medium and cheaper than any
+   * filtered alternative.
+   *
+   * Nothing is hand-placed. At boot the plate is measured for the horizon, the
+   * ship's extent and the moon (see analysePlate), so the geometry follows the
+   * artwork rather than a table of numbers.
+   */
+
+  const errorBox = document.getElementById('error');
+  const glCanvas = document.getElementById('gl');
+
+  function fail(message) {
+    errorBox.textContent = message;
+    errorBox.style.display = 'grid';
+  }
+
+  const TAU = Math.PI * 2;
+  const num = (value, fallback) => (Number.isFinite(Number(value)) ? Number(value) : fallback);
+  const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+
+  // ===========================================================================
+  // Shader
+  // ===========================================================================
+
+  const VERT = `#version 300 es
+  in vec2 aPos;
+  out vec2 vUv;
+  void main() {
+    // Y is flipped so uv.y = 0 is the TOP of both screen and texture. The
+    // texture half of that comes from uploading with UNPACK_FLIP_Y off, which
+    // puts the image's first row at t = 0. Every "above the horizon" test
+    // downstream depends on this convention.
+    vUv = vec2(aPos.x * 0.5 + 0.5, 0.5 - aPos.y * 0.5);
+    gl_Position = vec4(aPos, 0.0, 1.0);
+  }`;
+
+  const FRAG = `#version 300 es
+  precision highp float;
+
+  in vec2 vUv;
+  out vec4 fragColor;
+
+  uniform sampler2D uImage;
+  uniform vec2  uResolution;
+  uniform vec2  uPlate;         // plate size in texels
+  uniform float uImageAspect;
+  uniform float uTime;
+
+  uniform float uHorizon;       // image-space Y of the waterline
+  uniform vec2  uShipX;         // the ship's column span
+  uniform float uShipTop;       // image-space Y of the ship's highest point
+  uniform vec3  uMoon;          // xy = centre in image UV, z = radius
+
+  uniform float uRoll;          // this frame's roll angle, in radians
+  uniform float uSeaWobble;
+  uniform float uSeaRipple;
+  uniform float uSeaRate;
+  uniform float uShimmer;
+  uniform float uMoonGlow;
+  uniform float uSkyPulse;
+  uniform vec2  uShipFeather;
+
+  /** Screen UV -> image UV for a cover (crop) fit. The plate is 16:10 like the
+      target display, so in practice this is the identity. */
+  vec2 coverUv(vec2 uv) {
+    float screenAspect = uResolution.x / uResolution.y;
+    vec2 scale = screenAspect > uImageAspect
+      ? vec2(1.0, uImageAspect / screenAspect)
+      : vec2(screenAspect / uImageAspect, 1.0);
+    return (uv - 0.5) * scale + 0.5;
+  }
+
+  // 1 inside a range, ramping over "edge" at both ends so nothing shows a seam.
+  float span(vec2 range, float v, float edge) {
+    return smoothstep(range.x - edge, range.x + edge, v)
+         * (1.0 - smoothstep(range.y - edge, range.y + edge, v));
+  }
+
+  float hash21(vec2 p) {
+    vec3 q = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
+    q += dot(q, q.yzx + 33.33);
+    return fract((q.x + q.y) * q.z);
+  }
+
+  /**
+   * One field of expanding rings. The sea is cut into cells and each cell owns
+   * a single ring whose phase comes from a hash of the cell id, so nothing ever
+   * pulses in step. The ring is capped well short of half a cell, which is what
+   * stops the cell border from showing up as a grid.
+   */
+  vec2 rings(vec2 iuv, float scale, float rate, float seed) {
+    vec2 g = vec2(iuv.x, (iuv.y - uHorizon) * 2.6) * scale + seed;
+    vec2 id = floor(g);
+    vec2 jitter = vec2(hash21(id + 1.7), hash21(id + 9.1)) * 0.22 - 0.11;
+    vec2 d = fract(g) - 0.5 - jitter;
+
+    // Squashed distance: a circular ripple seen at this grazing angle is an
+    // ellipse, and a round one immediately reads as a bubble instead.
+    float dist = length(d * vec2(1.0, 2.1)) + 0.0004;
+    float phase = fract(uTime * rate * uSeaRate + hash21(id));
+    float radius = phase * 0.36;
+    float ring = sin((dist - radius) * 74.0) * exp(-abs(dist - radius) * 30.0);
+    float life = (1.0 - phase) * smoothstep(0.0, 0.09, phase);
+    return (d / dist) * ring * life * vec2(1.0, 0.5);
+  }
+
+  void main() {
+    vec2 base = coverUv(vUv);
+    vec2 offset = vec2(0.0);
+
+    // -- the ship rolls -------------------------------------------------------
+    //
+    // A rotation about the waterline, faded out through a box around the ship.
+    // Scaling the ANGLE by the mask rather than the result turns the edge of
+    // that box into a shear instead of a step, which is what lets a rectangle
+    // of sky rotate without showing its corners.
+    //
+    // The angle is tiny on purpose. Sky caught inside the box moves a pixel or
+    // two, which is nothing in a dithered cloud bank, while the mast tops -
+    // most of the frame away from the pivot - swing far enough to read clearly.
+    float shipMask = span(uShipX, base.x, uShipFeather.x)
+                   * span(vec2(uShipTop, uHorizon + 0.045), base.y, uShipFeather.y);
+    if (shipMask > 0.001) {
+      float angle = uRoll * shipMask;
+      vec2 pivot = vec2((uShipX.x + uShipX.y) * 0.5, uHorizon);
+      vec2 d = (base - pivot) * vec2(uImageAspect, 1.0);
+      float s = sin(angle);
+      float c = cos(angle);
+      vec2 turned = vec2(d.x * c - d.y * s, d.x * s + d.y * c);
+      offset += (turned - d) / vec2(uImageAspect, 1.0);
+    }
+
+    // -- the sea --------------------------------------------------------------
+    float sea = smoothstep(uHorizon, uHorizon + 0.018, base.y);
+    if (sea > 0.002) {
+      // Water nearer the camera makes bigger, slower shapes.
+      float near = 0.28 + 1.72 * clamp((base.y - uHorizon) / max(0.0001, 1.0 - uHorizon), 0.0, 1.0);
+
+      float wob = sin(base.x * 96.0 + uTime * 0.71)
+                + 0.62 * sin(base.x * 38.0 - uTime * 0.49 + 2.2)
+                + 0.34 * sin(base.x * 187.0 + uTime * 1.17 + 5.1);
+
+      vec2 wave = vec2(0.0, wob * uSeaWobble * near);
+      wave += rings(base, 30.0, 0.5, 0.0) * uSeaRipple * near;
+      wave += rings(base, 17.0, 0.31, 4.7) * uSeaRipple * near * 1.5;
+      offset += wave * sea;
+    }
+
+    // WHOLE TEXELS ONLY. Everything above produced a smooth offset; rounding it
+    // to the source grid here is the single line that keeps this pixel art
+    // instead of a slightly soft painting of pixel art.
+    offset = floor(offset * uPlate + 0.5) / uPlate;
+
+    vec3 color = texture(uImage, clamp(base + offset, 0.0, 1.0)).rgb;
+    float lum = dot(color, vec3(0.299, 0.587, 0.114));
+
+    // -- light ----------------------------------------------------------------
+    //
+    // From here down nothing moves; only brightness changes, so none of it can
+    // soften an edge.
+
+    // Broken water loses and regains the light it is reflecting as the surface
+    // tilts. Gated on brightness so it lives on the moon's path and the ship's
+    // reflection, and leaves the flat dark water alone.
+    float bright = smoothstep(0.22, 0.58, lum);
+    float glint = sin(base.x * 78.0 - uTime * 1.6) * sin(base.y * 86.0 + uTime * 0.83);
+    color *= 1.0 + uShimmer * bright * sea * glint;
+
+    // The moon. Two sines that share no period, so it never returns to a state
+    // you have already watched.
+    float toMoon = length((base - uMoon.xy) * vec2(uImageAspect, 1.0)) / max(0.0001, uMoon.z);
+    float disc = 1.0 - smoothstep(0.75, 1.6, toMoon);
+    color *= 1.0 + uMoonGlow * disc;
+
+    // A wave of light crawling along the cloud bank, far too slow to catch in
+    // the act. Warm pixels only, so it rides the lit edges of the clouds and
+    // not the dark sky between them.
+    float sky = 1.0 - smoothstep(uHorizon - 0.03, uHorizon, base.y);
+    float warmth = smoothstep(0.03, 0.28, color.r - color.b * 0.55);
+    float travel = sin(base.x * 2.3 - uTime * 0.11) * sin(base.y * 3.1 + uTime * 0.07);
+    color *= 1.0 + uSkyPulse * sky * warmth * travel;
+
+    fragColor = vec4(color, 1.0);
+  }`;
+
+  function compile(gl, type, source) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      throw new Error(gl.getShaderInfoLog(shader) || 'shader compile failed');
+    }
+    return shader;
+  }
+
+  function buildProgram(gl) {
+    const program = gl.createProgram();
+    gl.attachShader(program, compile(gl, gl.VERTEX_SHADER, VERT));
+    gl.attachShader(program, compile(gl, gl.FRAGMENT_SHADER, FRAG));
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      throw new Error(gl.getProgramInfoLog(program) || 'program link failed');
+    }
+    return program;
+  }
+
+  function loadImage(src) {
+    return new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = () => reject(new Error('Could not load ' + src));
+      image.src = src;
+    });
+  }
+
+  // ===========================================================================
+  // Measuring the plate
+  // ===========================================================================
+
+  /** Box blur along an array; row profiles are noisy at single-row resolution. */
+  function smoothed(values, radius) {
+    const out = new Float32Array(values.length);
+    for (let i = 0; i < values.length; i++) {
+      let sum = 0;
+      let n = 0;
+      for (let k = -radius; k <= radius; k++) {
+        const j = i + k;
+        if (j >= 0 && j < values.length) {
+          sum += values[j];
+          n++;
+        }
+      }
+      out[i] = sum / n;
+    }
+    return out;
+  }
+
+  /**
+   * The three things this wallpaper needs to know about the artwork.
+   *
+   *   HORIZON. Sea and sky are both busy, so brightness alone will not separate
+   *   them - but they are busy in different directions. Water is made of long
+   *   horizontal streaks and almost nothing changes down a column; clouds
+   *   change constantly down a column. So the horizon is where the average
+   *   vertical gradient collapses, and that reads cleanly whatever the palette
+   *   happens to be doing.
+   *
+   *   SHIP. Above the horizon the ship is the one tall dark mass in a bright
+   *   sky, so a per-column count of dark pixels finds it, and the run around
+   *   the peak gives its width.
+   *
+   *   MOON. The brightest and least colourful thing in the frame.
+   */
+  function analysePlate(image) {
+    const W = 320;
+    const H = 200;
+    const canvas = document.createElement('canvas');
+    canvas.width = W;
+    canvas.height = H;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(image, 0, 0, W, H);
+    const px = ctx.getImageData(0, 0, W, H).data;
+
+    const at = (x, y) => (y * W + x) * 4;
+    const lumAt = (x, y) => {
+      const i = at(x, y);
+      return (px[i] * 0.299 + px[i + 1] * 0.587 + px[i + 2] * 0.114) / 255;
+    };
+    const satAt = (x, y) => {
+      const i = at(x, y);
+      const hi = Math.max(px[i], px[i + 1], px[i + 2]);
+      const lo = Math.min(px[i], px[i + 1], px[i + 2]);
+      return hi <= 1 ? 0 : (hi - lo) / hi;
+    };
+
+    // -- horizon -------------------------------------------------------------
+    const churn = new Float32Array(H);
+    for (let y = 1; y < H; y++) {
+      let sum = 0;
+      for (let x = 0; x < W; x++) sum += Math.abs(lumAt(x, y) - lumAt(x, y - 1));
+      churn[y] = sum / W;
+    }
+    const calm = smoothed(churn, 3);
+
+    // Search the lower half only: the sea is always the bottom of a seascape,
+    // and the sky above holds cloud edges every bit as quiet as open water.
+    const lo = Math.round(0.45 * H);
+    const hi = Math.round(0.95 * H);
+    let drop = lo;
+    let best = 0;
+    for (let y = lo + 2; y < hi; y++) {
+      // The biggest fall in churn between what is just above and just below.
+      const above = (calm[y - 2] + calm[y - 1]) * 0.5;
+      const below = (calm[y + 1] + calm[y + 2]) * 0.5;
+      if (above - below > best) {
+        best = above - below;
+        drop = y;
+      }
+    }
+    const horizon = drop / H;
+
+    // -- the ship ------------------------------------------------------------
+    const skyBottom = Math.max(1, drop - 1);
+    let skyLum = 0;
+    let skyN = 0;
+    for (let y = 0; y < skyBottom; y++) {
+      for (let x = 0; x < W; x++) {
+        skyLum += lumAt(x, y);
+        skyN++;
+      }
+    }
+    skyLum /= Math.max(1, skyN);
+
+    const isDark = (x, y) => lumAt(x, y) < skyLum * 0.62;
+
+    const dark = new Float32Array(W);
+    for (let x = 0; x < W; x++) {
+      let c = 0;
+      for (let y = 0; y < skyBottom; y++) if (isDark(x, y)) c++;
+      dark[x] = c / skyBottom;
+    }
+    const darkSmooth = smoothed(dark, 2);
+    let peak = 0;
+    for (let x = 1; x < W; x++) if (darkSmooth[x] > darkSmooth[peak]) peak = x;
+
+    // The cloud bank is dark in places too, so every column carries some dark
+    // regardless of the ship. Measuring the run against that background rather
+    // than against zero is what lets the threshold be generous enough to keep
+    // the bowsprit and the yardarms without swallowing the whole sky.
+    const sorted = Array.from(darkSmooth).sort((p, q) => p - q);
+    const floorLevel = sorted[Math.round(sorted.length * 0.25)];
+    const cut = floorLevel + (darkSmooth[peak] - floorLevel) * 0.18;
+    let a = peak;
+    let b = peak;
+    while (a > 0 && darkSmooth[a - 1] > cut) a--;
+    while (b < W - 1 && darkSmooth[b + 1] > cut) b++;
+
+    // Dark mass finds the hull and the masts, which is the ship's body. The
+    // bowsprit and the outer yardarm tips are single spars against a bright
+    // sky and carry almost no mass at all, so no threshold on this profile
+    // will ever reach them. Widening by a share of the body's own width takes
+    // them in, and keeps the roll at full strength right across the ship so
+    // its rigging cannot shear against its hull.
+    const margin = Math.round((b - a) * 0.16);
+    a = Math.max(0, a - margin);
+    b = Math.min(W - 1, b + margin);
+
+    // How high the rigging reaches.
+    //
+    // Absolute darkness cannot answer this. The night sky at the top of the
+    // frame is every bit as dark as the masts, so any fixed threshold puts the
+    // ship's top edge at row zero and the roll then shears the whole cloud
+    // bank. Neither does run length: that upper sky is a long dark run too.
+    //
+    // What does separate them is CONTRAST ALONG THE ROW. Rigging is a narrow
+    // dark thing with lit sky on both sides of it, while the sky at the top of
+    // the frame is uniformly dark the whole way across. So each pixel is judged
+    // against the middle of its own row rather than against the picture.
+    const rowMid = new Float32Array(skyBottom);
+    const scratch = [];
+    for (let y = 0; y < skyBottom; y++) {
+      scratch.length = 0;
+      for (let x = 0; x < W; x += 3) scratch.push(lumAt(x, y));
+      scratch.sort((p, q) => p - q);
+      rowMid[y] = scratch[scratch.length >> 1];
+    }
+    const isRigging = (x, y) => lumAt(x, y) < rowMid[y] * 0.62;
+
+    // A few rows at least, so a stray dithered pixel in a cloud cannot claim to
+    // be a masthead.
+    const minRun = Math.max(3, Math.round(0.03 * H));
+    let top = skyBottom;
+    for (let x = a; x <= b; x++) {
+      let runStart = -1;
+      for (let y = 0; y <= skyBottom; y++) {
+        const on = y < skyBottom && isRigging(x, y);
+        if (on && runStart < 0) runStart = y;
+        else if (!on && runStart >= 0) {
+          if (y - runStart >= minRun && runStart < top) top = runStart;
+          runStart = -1;
+        }
+      }
+    }
+
+    // -- the moon ------------------------------------------------------------
+    let mx = 0;
+    let my = 0;
+    let mn = 0;
+    let bestScore = -1;
+    let seedX = 0;
+    let seedY = 0;
+    for (let y = 0; y < skyBottom; y++) {
+      for (let x = 0; x < W; x++) {
+        const score = lumAt(x, y) - satAt(x, y) * 0.8;
+        if (score > bestScore) {
+          bestScore = score;
+          seedX = x;
+          seedY = y;
+        }
+      }
+    }
+    // A generous cut, because the moon has darker patches across its face and a
+    // tight one measures only the brightest crescent of it - which drags the
+    // centre off and reports a disc smaller than the one you can see.
+    const moonCut = Math.max(0.45, lumAt(seedX, seedY) * 0.6);
+    let minX = seedX;
+    let maxX = seedX;
+    let minY = seedY;
+    let maxY = seedY;
+    for (let y = 0; y < skyBottom; y++) {
+      for (let x = 0; x < W; x++) {
+        if (lumAt(x, y) < moonCut || satAt(x, y) > 0.4) continue;
+        // Only the blob the seed belongs to, not every pale cloud in the frame.
+        if (Math.abs(x - seedX) > W * 0.14 || Math.abs(y - seedY) > H * 0.2) continue;
+        mx += x;
+        my += y;
+        mn++;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+    // The radius has to come back in the SAME units the shader measures
+    // distance in. It multiplies x by the image aspect before taking a length,
+    // which puts distance in units of pixels-over-image-height - so the y
+    // half-extent is already right and the x one has to be scaled to match.
+    // The analysis grid is cut to the plate's aspect, so W / H is that factor.
+    const aspect = W / H;
+    const moon = mn
+      ? [
+          mx / mn / W,
+          my / mn / H,
+          Math.max(0.02, Math.max(((maxX - minX) / 2 / W) * aspect, (maxY - minY) / 2 / H))
+        ]
+      : [0.4, 0.15, 0.09];
+
+    return {
+      width: image.naturalWidth || image.width,
+      height: image.naturalHeight || image.height,
+      horizon,
+      ship: [a / W, (b + 1) / W],
+      shipTop: top / H,
+      moon
+    };
+  }
+
+  // ===========================================================================
+
+  async function boot() {
+    const config = await window.wallpaperForge.getConfig();
+    if (!config || !config.wallpaper) return fail('No wallpaper assigned.');
+    const props = config.wallpaper.properties || {};
+
+    const gl = glCanvas.getContext('webgl2', {
+      antialias: false,
+      alpha: false,
+      powerPreference: 'low-power'
+    });
+    if (!gl) return fail('WebGL2 is not available on this machine.');
+
+    // Same origin as this page, so no CORS opt-in is needed for the upload.
+    const image = await loadImage('media/plate.png');
+    const plate = analysePlate(image);
+
+    const program = buildProgram(gl);
+    gl.useProgram(program);
+
+    const buffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+    const aPos = gl.getAttribLocation(program, 'aPos');
+    gl.enableVertexAttribArray(aPos);
+    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+    const texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false); // uv.y = 0 is the top of the image
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+    const u = (name) => gl.getUniformLocation(program, name);
+
+    gl.uniform1i(u('uImage'), 0);
+    gl.uniform1f(u('uImageAspect'), plate.width / plate.height);
+    gl.uniform2f(u('uPlate'), plate.width, plate.height);
+    gl.uniform1f(u('uHorizon'), num(props.horizon, plate.horizon));
+    gl.uniform2f(u('uShipX'), plate.ship[0], plate.ship[1]);
+    gl.uniform1f(u('uShipTop'), plate.shipTop);
+    gl.uniform3f(u('uMoon'), plate.moon[0], plate.moon[1], plate.moon[2]);
+
+    gl.uniform1f(u('uSeaWobble'), 0.0022 * num(props.seaStrength, 1));
+    gl.uniform1f(u('uSeaRipple'), 0.0016 * num(props.rippleStrength, 1));
+    gl.uniform1f(u('uSeaRate'), num(props.seaRate, 1));
+    gl.uniform1f(u('uShimmer'), 0.22 * num(props.shimmerStrength, 1));
+    gl.uniform1f(u('uSkyPulse'), 0.05 * num(props.skyPulse, 1));
+    gl.uniform2f(u('uShipFeather'), num(props.shipFeatherX, 0.07), num(props.shipFeatherY, 0.06));
+
+    // The roll: two periods that share no common multiple, so the ship never
+    // repeats a motion you have already seen. A swell is slow - the default
+    // works out at roughly a nine second cycle with a longer one under it.
+    const rollAmp = num(props.rollDegrees, 0.26) * (Math.PI / 180);
+    const rollRate = num(props.rollRate, 1);
+    const moonAmp = num(props.moonGlow, 0.05);
+    const moonRate = num(props.moonRate, 1);
+
+    const uRoll = u('uRoll');
+    const uMoonGlow = u('uMoonGlow');
+    const uTime = u('uTime');
+    const uResolution = u('uResolution');
+
+    function resize() {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const w = Math.max(1, Math.round(window.innerWidth * dpr));
+      const h = Math.max(1, Math.round(window.innerHeight * dpr));
+      glCanvas.width = w;
+      glCanvas.height = h;
+      gl.viewport(0, 0, w, h);
+      gl.uniform2f(uResolution, w, h);
+    }
+    resize();
+    window.addEventListener('resize', resize);
+
+    let raf = null;
+    let last = performance.now();
+    let clock = 0;
+
+    function frame(now) {
+      raf = requestAnimationFrame(frame);
+      const dt = Math.min(0.05, (now - last) / 1000);
+      last = now;
+      clock += dt;
+
+      const roll =
+        rollAmp *
+        (0.72 * Math.sin(clock * TAU * 0.109 * rollRate) +
+          0.28 * Math.sin(clock * TAU * 0.041 * rollRate + 1.7));
+      gl.uniform1f(uRoll, roll);
+      gl.uniform1f(
+        uMoonGlow,
+        moonAmp * (0.5 + 0.5 * Math.sin(clock * TAU * 0.037 * moonRate))
+      );
+      gl.uniform1f(uTime, clock);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    }
+
+    function start() {
+      if (raf !== null) return;
+      last = performance.now();
+      raf = requestAnimationFrame(frame);
+    }
+    function stop() {
+      if (raf === null) return;
+      cancelAnimationFrame(raf);
+      raf = null;
+    }
+
+    // This runs 24/7 behind the desktop, so a live rAF while paused would burn
+    // CPU forever.
+    window.wallpaperForge.onPause((paused) => (paused ? stop() : start()));
+    if (!window.wallpaperForge.isPaused()) start();
+  }
+
+  boot().catch((err) => fail(String(err && err.message ? err.message : err)));
+</script>

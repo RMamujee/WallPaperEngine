@@ -1,0 +1,24 @@
+{
+  "name": "Moonlit Galleon",
+  "type": "web",
+  "entry": "index.html",
+  "description": "A pixel-art tall ship becalmed under a full moon: the sea wobbles and rings, the ship rolls on the swell, and a slow wave of light crawls along the sunset cloud bank",
+  "preview": "media/plate.png",
+  "audio": false,
+  "cursor": false,
+  "properties": {
+    "seaStrength": 1,
+    "rippleStrength": 1,
+    "seaRate": 1,
+    "shimmerStrength": 1,
+
+    "rollDegrees": 0.26,
+    "rollRate": 1,
+    "shipFeatherX": 0.07,
+    "shipFeatherY": 0.06,
+
+    "moonGlow": 0.05,
+    "moonRate": 1,
+    "skyPulse": 1
+  }
+}

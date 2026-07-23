@@ -4,7 +4,7 @@
   "entry": "index.html",
   "description": "Layered rain over a blue night corner: the wet road ripples and splashes while the traffic light cycles. The taxi stays parked at the kerb.",
   "preview": "media/plate.png",
-  "audio": false,
+  "audio": true,
   "cursor": true,
   "properties": {
     "rainCount": 950,
@@ -18,6 +18,17 @@
     "rippleRate": 1,
     "wobbleStrength": 1,
     "shimmerStrength": 1,
+
+    "bassWater": 0.9,
+    "midGlow": 0.16,
+    "trebleRain": 0.85,
+    "trebleSplash": 1.1,
+
+    "audioAttack": 0.05,
+    "audioRelease": 0.45,
+    "audioPeakFall": 12,
+    "audioFloor": 0.006,
+    "audioGate": 0.02,
 
     "redSeconds": 12,
     "greenSeconds": 10,

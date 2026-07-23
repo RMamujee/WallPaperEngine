@@ -18,11 +18,8 @@
   }
   /* The snow falls across the whole frame, so this layer covers the screen and
      sits above the shader. Its top is still set from script rather than fixed
-     at 0, because layout() owns the placement. #lamps is the same idea but
-     only covers the machines' lower panels; it sits under #fx in DOM order so
-     that snow passes in front of the lights, as it does everything else. */
-  #fx,
-  #lamps {
+     at 0, because layout() owns the placement. */
+  #fx {
     position: fixed;
     left: 0;
     display: block;
@@ -40,7 +37,6 @@
   }
 </style>
 <canvas id="gl"></canvas>
-<canvas id="lamps"></canvas>
 <canvas id="fx"></canvas>
 <div id="error"></div>
 
@@ -56,22 +52,39 @@
    *
    *   - the shader owns the lights. Each vending machine's glass front breathes
    *     on its own rhythm, the ceiling tubes hum and occasionally stutter, one
-   *     machine has a failing tube, and each machine's reflection in the wet
-   *     floor brightens and dims with the machine above it
-   *   - the lamp overlay owns the small lights on the machines themselves: a
-   *     rail of selection buttons under each glass front and a coin-slot
-   *     indicator beside it, some steady and glowing, some blinking
-   *   - the snow overlay owns the snow, which falls in front of everything
+   *     machine has a failing tube, the indicator lamps on the control panels
+   *     blink slowly out of step with each other, and each machine's reflection
+   *     in the wet floor brightens and dims with the machine above it
+   *   - the overlay owns the snow, which is confined to the window band so it
+   *     reads as weather on the far side of the glass
    *
    * Nothing is hand-placed. At boot the plate is measured: the lit band, the
-   * seven machines, the ceiling tubes, the floor, and a mask of the night city
-   * are all found from the artwork's own luminance, saturation and colour (see
-   * analysePlate). Repaint the plate and the geometry follows it.
+   * seven machines, the ceiling tubes, the floor, the control-panel lamps and a
+   * mask of the night city are all found from the artwork's own luminance,
+   * saturation and colour (see analysePlate). Repaint the plate and the
+   * geometry follows it.
+   *
+   * A LIGHT IS A REGION, NOT A BRIGHTNESS TEST. Each lamp gets the rectangle of
+   * the surface it actually lights - this machine's glass window, this tube -
+   * measured per lamp, and inside that rectangle every pixel is scaled by the
+   * same factor. Two things fall out of that, and both are the difference
+   * between a lamp and a stain:
+   *
+   *   - the light is the shape of the thing that emits it. An earlier version
+   *     asked "is this pixel bright?" instead, over one shared full-width band.
+   *     That lights whatever happens to be pale - the machines' own frames, the
+   *     shopfront - so each light spread to the whole cabinet, and the band's
+   *     straight edge cut across the products of any machine whose glass did
+   *     not happen to end where the average one did.
+   *   - a flat scale keeps the picture's contrast exactly as paint. Weighting
+   *     the swing by each pixel's brightness stretches the palette instead, so
+   *     the shelves flare toward white and the pixel art turns to mush. Only
+   *     the additive bloom is brightness-gated, and only near white, because a
+   *     lamp's core really does wash out.
    */
 
   const errorBox = document.getElementById('error');
   const glCanvas = document.getElementById('gl');
-  const lampCanvas = document.getElementById('lamps');
   const fxCanvas = document.getElementById('fx');
 
   function fail(message) {
@@ -82,6 +95,7 @@
   const TAU = Math.PI * 2;
   const MAX_MACHINES = 8;
   const MAX_TUBES = 4;
+  const MAX_BLINKERS = 12;
 
   const num = (value, fallback) => (Number.isFinite(Number(value)) ? Number(value) : fallback);
   const nums = (value, fallback) =>
@@ -130,23 +144,30 @@
   uniform float uImageAspect;
   uniform float uTime;
 
-  uniform vec2  uGlassBand;      // image-space Y range of the lit machine fronts
   uniform vec2  uFloorBand;      // image-space Y range of the wet floor
-  uniform vec2  uTubeBand;       // image-space Y range of the ceiling tubes
 
-  // xy = the x span in image UV, z = this frame's brightness level.
-  uniform vec4  uMachine[8];
+  // Every light is a rectangle in image UV, measured off the plate.
+  uniform vec4  uMachineGlass[8]; // x0, x1, y0, y1 of one machine's glass window
+  uniform vec2  uMachineCol[8];   // that machine's full cabinet width, for its
+                                  // reflection, which is as wide as the machine
+  uniform float uMachineLevel[8]; // this frame's brightness, per machine
   uniform int   uMachineCount;
-  uniform vec4  uTube[4];
+  uniform vec4  uTubeRect[4];     // x0, x1, y0, y1 of one ceiling tube
+  uniform float uTubeLevel[4];
   uniform int   uTubeCount;
+  uniform vec4  uBlinkRect[12];   // x0, x1, y0, y1 of one control-panel lamp
+  uniform float uBlinkLevel[12];
+  uniform int   uBlinkCount;
 
-  uniform vec2  uGlassLevels;    // luminance ramp that isolates the lit glass
-  uniform vec2  uFloorLevels;    // ... the reflections in the floor
-  uniform vec2  uTubeLevels;     // ... the tubes themselves
+  uniform vec2  uGlassFeather;   // how far each light fades out, x and y, in UV
+  uniform vec2  uTubeFeather;
+  uniform vec2  uBlinkFeather;
+  uniform float uFloorFeather;
   uniform float uFloorGain;      // how much of a machine's swing reaches its reflection
   uniform float uFloorWobble;    // reflection wobble, in WHOLE source texels
   uniform float uFloorWobbleRate;
   uniform float uBloom;          // extra lift toward white on the up-swing
+  uniform vec2  uBloomLevels;    // ... which only pixels this bright receive
 
   /** Screen UV -> image UV for a cover (crop) fit. The plate is 16:10 like the
       target display, so in practice this is the identity. */
@@ -158,10 +179,18 @@
     return (uv - 0.5) * scale + 0.5;
   }
 
-  // 1 inside a band, ramping over "edge" at both ends so nothing shows a seam.
-  float band(vec2 range, float y, float edge) {
-    return smoothstep(range.x - edge, range.x + edge, y)
-         * (1.0 - smoothstep(range.y - edge, range.y + edge, y));
+  // 1 inside a range, ramping over "edge" at both ends so nothing shows a seam.
+  float span(vec2 range, float v, float edge) {
+    return smoothstep(range.x - edge, range.x + edge, v)
+         * (1.0 - smoothstep(range.y - edge, range.y + edge, v));
+  }
+
+  // A lamp's footprint: soft on all four sides. The feather is what stops the
+  // rectangle from being visible as a rectangle - it has to be wide enough that
+  // the edge lands somewhere unlit (a bezel, the dark ceiling) rather than
+  // ending mid-shelf.
+  float softBox(vec4 rect, vec2 p, vec2 feather) {
+    return span(rect.xy, p.x, feather.x) * span(rect.zw, p.y, feather.y);
   }
 
   void main() {
@@ -175,7 +204,7 @@
     // read as pixel art. So the offset is rounded to whole texels. The
     // reflection slides in visible steps, which is both correct for the medium
     // and cheaper than any filtered alternative.
-    float floorRamp = band(uFloorBand, base.y, 0.008);
+    float floorRamp = span(uFloorBand, base.y, uFloorFeather);
 
     vec2 uv = base;
     if (floorRamp > 0.002) {
@@ -189,59 +218,93 @@
     vec3 color = texture(uImage, clamp(uv, 0.0, 1.0)).rgb;
     float l = dot(color, vec3(0.299, 0.587, 0.114));
 
-    // -- which machine owns this column, and how bright is it this frame? ----
+    // Only the core of a lamp washes toward white as it brightens; a shelf in
+    // shadow behind the same glass just gets brighter. This gate is used ONLY
+    // for that additive term - never for the scale - so the picture's contrast
+    // is untouched. Do not name it "flat": that is a reserved interpolation
+    // qualifier in GLSL ES 3. Avoid backticks in here too: this shader is a JS
+    // template literal and one anywhere inside, comments included, would end it
+    // early.
+    float core = smoothstep(uBloomLevels.x, uBloomLevels.y, l);
+
+    // -- the machines -------------------------------------------------------
     //
-    // Accumulating a weighted average rather than picking one machine gives the
-    // borders a few pixels of blend. The bezels between machines are dark so it
-    // would not show there, but the reflections in the floor run together and a
-    // hard switch between two levels would draw a vertical seam across them.
-    float acc = 0.0;
-    float wsum = 0.0;
+    // Two footprints per machine, because a machine lights two different
+    // things: its own glass window, and its reflection in the wet floor, which
+    // is as wide as the whole cabinet rather than as wide as the glass.
+    //
+    // Both accumulate a weighted average rather than picking one machine, so
+    // where two footprints meet the level crossfades. The bezels between the
+    // machines are dark and would hide a hard switch, but their reflections run
+    // together on the floor and a hard switch there draws a vertical seam.
+    float gAcc = 0.0;
+    float gSum = 0.0;
+    float cAcc = 0.0;
+    float cSum = 0.0;
     for (int i = 0; i < 8; i++) {
       if (i >= uMachineCount) break;
-      vec4 m = uMachine[i];
-      float w = smoothstep(m.x - 0.004, m.x + 0.004, base.x)
-              * (1.0 - smoothstep(m.y - 0.004, m.y + 0.004, base.x));
-      acc += m.z * w;
-      wsum += w;
+      float level = uMachineLevel[i];
+
+      float g = softBox(uMachineGlass[i], base, uGlassFeather);
+      gAcc += level * g;
+      gSum += g;
+
+      float c = span(uMachineCol[i], base.x, 0.006);
+      cAcc += level * c;
+      cSum += c;
     }
-    float level = wsum > 0.001 ? acc / wsum : 1.0;
-    float reach = min(1.0, wsum);
 
-    // The glass fronts, and their reflections one band below. Do not name the
-    // luminance gate "flat" - that is a reserved interpolation qualifier in
-    // GLSL ES 3. Avoid backticks in here too: this shader is a JS template
-    // literal and one anywhere inside, comments included, would end it early.
-    float glass = band(uGlassBand, base.y, 0.010)
-                * smoothstep(uGlassLevels.x, uGlassLevels.y, l);
-    float pool = floorRamp * smoothstep(uFloorLevels.x, uFloorLevels.y, l) * uFloorGain;
+    if (gSum > 0.001) {
+      float level = gAcc / gSum;
+      float amt = min(1.0, gSum);
+      color *= mix(1.0, level, amt);
+      color += max(0.0, level - 1.0) * amt * core * uBloom;
+    }
 
-    float amount = max(glass, pool) * reach;
-    color *= mix(1.0, level, amount);
-    // A light getting brighter also gets whiter at its core. Without this the
-    // swing reads as a gain knob rather than as a lamp.
-    color += max(0.0, level - 1.0) * amount * uBloom;
+    // The reflection. floorRamp is zero everywhere the glass footprints reach,
+    // so nothing is scaled twice.
+    if (cSum > 0.001) {
+      float level = cAcc / cSum;
+      float amt = floorRamp * min(1.0, cSum) * uFloorGain;
+      color *= mix(1.0, level, amt);
+      color += max(0.0, level - 1.0) * amt * core * uBloom;
+    }
 
     // -- ceiling tubes ------------------------------------------------------
-    float tacc = 0.0;
-    float tsum = 0.0;
+    float tAcc = 0.0;
+    float tSum = 0.0;
     for (int i = 0; i < 4; i++) {
       if (i >= uTubeCount) break;
-      vec4 t = uTube[i];
-      float w = smoothstep(t.x - 0.004, t.x + 0.004, base.x)
-              * (1.0 - smoothstep(t.y - 0.004, t.y + 0.004, base.x));
-      tacc += t.z * w;
-      tsum += w;
+      float w = softBox(uTubeRect[i], base, uTubeFeather);
+      tAcc += uTubeLevel[i] * w;
+      tSum += w;
     }
-    if (tsum > 0.001) {
-      // The band ramp is wider than the tube so the glow spilling onto the
-      // ceiling and the frame dims with it; the luminance gate keeps the
-      // unlit ceiling out of it.
-      float amt = band(uTubeBand, base.y, 0.011) * min(1.0, tsum)
-                * smoothstep(uTubeLevels.x, uTubeLevels.y, l);
-      float tLevel = tacc / tsum;
-      color *= mix(1.0, tLevel, amt);
-      color += max(0.0, tLevel - 1.0) * amt * uBloom;
+    if (tSum > 0.001) {
+      float level = tAcc / tSum;
+      float amt = min(1.0, tSum);
+      color *= mix(1.0, level, amt);
+      color += max(0.0, level - 1.0) * amt * core * uBloom;
+    }
+
+    // -- the indicator lamps on the control panels --------------------------
+    //
+    // Same footprint-and-scale as every other lamp here, only much smaller:
+    // these are readouts and LEDs a few art pixels across. Their rectangles are
+    // already padded by the feather on the way in, so the whole lamp swings at
+    // the full level and the ramp lands on the dark housing around it.
+    float kAcc = 0.0;
+    float kSum = 0.0;
+    for (int i = 0; i < 12; i++) {
+      if (i >= uBlinkCount) break;
+      float w = softBox(uBlinkRect[i], base, uBlinkFeather);
+      kAcc += uBlinkLevel[i] * w;
+      kSum += w;
+    }
+    if (kSum > 0.001) {
+      float level = kAcc / kSum;
+      float amt = min(1.0, kSum);
+      color *= mix(1.0, level, amt);
+      color += max(0.0, level - 1.0) * amt * core * uBloom;
     }
 
     fragColor = vec4(color, 1.0);
@@ -340,6 +403,14 @@
    * gaps. The ceiling tubes are the opposite - bright but nearly colourless -
    * which separates them from the machines cleanly. The floor is simply the
    * brightest band below everything else.
+   *
+   * Those bands locate the lamps. They are NOT the lamps: every lamp is then
+   * measured on its own, because the machines in this plate are not a tidy row.
+   * Their glass windows start and stop at different heights, and each sits
+   * inside a cabinet frame that is pale and bright but emits nothing. A shared
+   * band lights the frames along with the glass and cuts a straight edge across
+   * whichever machine disagrees with the average. So each machine re-measures
+   * its own window inside its own columns, and each tube its own box.
    */
   function analysePlate(image) {
     const W = image.naturalWidth || image.width;
@@ -388,7 +459,88 @@
       }
       colLit[x] = c / n;
     }
-    const machines = findRuns(colLit, 0.05, 18, 110).slice(0, MAX_MACHINES);
+    const machineCols = findRuns(colLit, 0.05, 18, 110).slice(0, MAX_MACHINES);
+
+    /**
+     * How tall one lamp is, inside columns the band has already narrowed to.
+     *
+     * Per column, the topmost and bottommost row that passes `test`; then the
+     * MEDIAN of each across the columns. Not a row profile: the dark shelf
+     * dividers inside a vending machine are full-width dips, so any row-wise
+     * measure either halts at the first divider - clipping the window to one
+     * shelf - or has to bridge gaps so wide it escapes the machine entirely.
+     * Per column there is no divider to trip over, and the median then ignores
+     * both the column that catches a sign above the cabinet and the one whose
+     * top shelf happens to hold something dark.
+     */
+    const verticalSpan = (test, x0, x1, lo, hi) => {
+      const tops = [];
+      const bottoms = [];
+      for (let x = x0; x < x1; x += 2) {
+        let top = -1;
+        let bottom = -1;
+        for (let y = lo; y < hi; y++) {
+          if (!test(x, y)) continue;
+          if (top < 0) top = y;
+          bottom = y;
+        }
+        if (top >= 0) {
+          tops.push(top);
+          bottoms.push(bottom);
+        }
+      }
+      if (!tops.length) return [lo, hi];
+      const mid = (arr) => arr.sort((a, b) => a - b)[arr.length >> 1];
+      return [mid(tops), mid(bottoms)];
+    };
+    const colsWhere = (test, x0, x1, y0, y1, frac) => {
+      const prof = new Float32Array(x1 - x0);
+      let peak = 0;
+      for (let x = x0; x < x1; x++) {
+        let c = 0;
+        let n = 0;
+        for (let y = y0; y <= y1; y += 2) {
+          if (test(x, y)) c++;
+          n++;
+        }
+        prof[x - x0] = n ? c / n : 0;
+        if (prof[x - x0] > peak) peak = prof[x - x0];
+      }
+      const cut = peak * frac;
+      let a = 0;
+      let b = prof.length - 1;
+      while (a < b && prof[a] < cut) a++;
+      while (b > a && prof[b] < cut) b--;
+      return [x0 + a, x0 + b + 1];
+    };
+
+    // -- each machine's own glass window -------------------------------------
+    //
+    // Vertical first, because the window's height is what the shared band got
+    // wrong; then horizontal, which is what trims the cabinet frame off. The
+    // frame is bright but colourless, so it fails isLit and falls outside the
+    // run - the same test that told the machines apart also tells a machine
+    // from its own frame.
+    //
+    // The search is bounded to the shared band plus a margin. A machine's own
+    // window is free to start higher or end lower than the average one - that
+    // freedom is the whole point - but not free to wander up into the lit
+    // shelves behind the shopfront glass, which pass the same test.
+    //
+    // The margin is lopsided because the row is: the machines stand on one
+    // floor under one ceiling so their windows start at nearly one height, but
+    // they are different cabinets and their windows end wherever each one's
+    // dispensing bay begins. Tight above, loose below.
+    const mLo = Math.max(0, gTop - Math.round(0.025 * H));
+    const mHi = Math.min(H, gBot + Math.round(0.07 * H));
+    const machines = machineCols.map(([x0, x1]) => {
+      const [wy0, wy1] = verticalSpan(isLit, x0, x1, mLo, mHi);
+      const [wx0, wx1] = colsWhere(isLit, x0, x1, wy0, wy1, 0.35);
+      return {
+        col: [x0 / W, x1 / W],
+        glass: [wx0 / W, wx1 / W, wy0 / H, wy1 / H]
+      };
+    });
 
     // -- ceiling tubes: bright but colourless -------------------------------
     const rowPale = new Float32Array(H);
@@ -413,7 +565,17 @@
       }
       colPale[x] = c / n;
     }
-    const tubes = findRuns(colPale, 0.15, 80, 80).slice(0, MAX_TUBES);
+    const tubeCols = findRuns(colPale, 0.15, 80, 80).slice(0, MAX_TUBES);
+
+    // A tube is thin, so its own box matters more than a machine's: the shared
+    // band was three times the height of the fixture, which spread each tube's
+    // stutter onto the ceiling and the shopfront above it.
+    const tLo = Math.max(0, tTop - Math.round(0.02 * H));
+    const tHi = Math.min(H, tBot + Math.round(0.02 * H));
+    const tubes = tubeCols.map(([x0, x1]) => {
+      const [ty0, ty1] = verticalSpan(isPale, x0, x1, tLo, tHi);
+      return [x0 / W, x1 / W, ty0 / H, ty1 / H];
+    });
 
     // -- the wet floor: the bright band below everything else ----------------
     const rowLum = new Float32Array(H);
@@ -428,59 +590,293 @@
     }
     const [fTop, fBot] = peakBand(smoothed(rowLum, 4), Math.round(0.75 * H), Math.round(0.97 * H), 0.45);
 
-    // -- the lower panels, and the colour each machine lights itself with -----
+    // -- the indicator lamps on each machine's control panel -----------------
     //
-    // Everything below the lit glass and above the floor is the machine's
-    // control face: buttons, coin slot, delivery flap. It is the dark part of
-    // an otherwise bright object, which is where a real machine puts its
-    // indicators and where added ones do not have to compete with product art.
+    // A real machine wears its lamps on the cabinet, not behind the product
+    // glass: the credit readout, the LED on the card reader, the lit icons over
+    // the coin slot. So the search runs below each machine's own window, inside
+    // its own columns, down to the floor.
     //
-    // The tint is measured, not chosen, so a lamp belongs to the machine it is
-    // on: the crimson cabinet gets warm buttons and the blue one cold.
+    // Finding them is not a brightness test, because this cabinet band is dark
+    // everywhere and the cabinets themselves range from near-black green to
+    // white. Three measurements together say "lamp", and each one throws out a
+    // different impostor:
     //
-    // It is read from the CABINET - the panel the lamp is mounted on - and not
-    // from the lit shelves above it. The shelves look like the more obvious
-    // source and they do not work: at night every machine's glass is dominated
-    // by the same fluorescent cyan, so all seven come back the same colour.
+    //   - it breaks the night's colour. The whole picture is cast blue (the
+    //     median colour of the plate is the reference), and anything merely lit
+    //     by that night keeps the cast - which is every paper notice taped to
+    //     these machines. A lamp makes its own colour and does not.
+    //   - it is saturated. That drops the pale and near-grey shapes printed on
+    //     the signage, which also break the cast but are ink, not light.
+    //   - it is brighter than its immediate surroundings, and its surroundings
+    //     are darker than the cabinet's own face - that is, it sits down inside
+    //     a recess. Lamps are set into the coin unit and the readout housing;
+    //     a poster is stuck flat on the outside of the cabinet.
     //
-    // Nor can the result be normalised by its largest channel, which is what
-    // pins that cyan in place: in a blue-lit scene blue is the largest channel
-    // almost everywhere, and forcing it to 255 throws the hue away before it
-    // can be used. Scaling by luminance instead keeps the ratios between the
-    // channels, which is where the hue actually lives.
-    const LAMP_NEUTRAL = [214, 240, 255];
-    const tints = machines.map(([x0, x1]) => {
-      let r = 0;
-      let g = 0;
-      let b = 0;
+    // A machine whose window runs all the way to the floor has no cabinet at
+    // all, only shelves of product, and every bright speck in it is a label. So
+    // a machine is skipped outright if its band is too busy to be a panel.
+    //
+    // Some machines end up with no lamp. That is the artwork's answer, not a
+    // failure: forcing one on every machine is exactly the hand-placing this
+    // file exists to avoid.
+    const medianColour = (x0, x1, y0, y1, step) => {
+      const bins = [new Uint32Array(256), new Uint32Array(256), new Uint32Array(256)];
       let n = 0;
-      for (let y = gBot; y < fTop; y += 2) {
-        for (let x = x0; x < x1; x += 2) {
-          const s = satAt(x, y);
-          // Painted metal only. The gate drops the grey hardware and the dark
-          // gaps, so a machine with no colour of its own falls through to the
-          // neutral lamp rather than to whatever its coin slot happens to be.
-          if (s < 0.15 || lumAt(x, y) < 0.08) continue;
+      for (let y = y0; y < y1; y += step) {
+        for (let x = x0; x < x1; x += step) {
           const i = (y * W + x) * 4;
-          r += data[i] * s;
-          g += data[i + 1] * s;
-          b += data[i + 2] * s;
-          n += s;
+          bins[0][data[i]]++;
+          bins[1][data[i + 1]]++;
+          bins[2][data[i + 2]]++;
+          n++;
         }
       }
-      if (n < 40) return LAMP_NEUTRAL;
-      r /= n;
-      g /= n;
-      b /= n;
-      const k = 235 / Math.max(1, r * 0.299 + g * 0.587 + b * 0.114);
-      // A little toward white, because the core of a lamp is paler than its
-      // hue - but not so far that the hue identifying the machine is gone.
-      return [
-        Math.round(Math.min(255, lerp(r * k, 255, 0.28))),
-        Math.round(Math.min(255, lerp(g * k, 255, 0.28))),
-        Math.round(Math.min(255, lerp(b * k, 255, 0.28)))
-      ];
+      return bins.map((bin) => {
+        let acc = 0;
+        for (let v = 0; v < 256; v++) {
+          acc += bin[v];
+          if (acc >= n / 2) return v;
+        }
+        return 0;
+      });
+    };
+    const lumOf = (c) => (c[0] * 0.299 + c[1] * 0.587 + c[2] * 0.114) / 255;
+    // How far a colour sits from the night's own colour, with brightness
+    // divided out first. Without that division every test below is a brightness
+    // test wearing a hat: a dim lamp and a bright one of the same hue have to
+    // compare equal.
+    const nightHue = (() => {
+      const c = medianColour(0, W, 0, H, 2);
+      const s = c[0] + c[1] + c[2] || 1;
+      return [c[0] / s, c[1] / s, c[2] / s];
+    })();
+    const hueGap = (r, g, b) => {
+      const s = r + g + b || 1;
+      return (
+        Math.abs(r / s - nightHue[0]) + Math.abs(g / s - nightHue[1]) + Math.abs(b / s - nightHue[2])
+      );
+    };
+
+    // Everything below is in art pixels, so it is written as a fraction of the
+    // plate: a bigger repaint of the same picture measures the same way.
+    const LAMP_NEAR = Math.max(4, Math.round(0.0055 * W)); // local-background radius
+    const LAMP_GLUE = Math.max(1, Math.round(0.0004 * W)); // one art pixel of slack when grouping
+    const LAMP_MIN = Math.max(2, Math.round(0.0016 * W)); // one art pixel of this plate
+    const LAMP_MAX = Math.round(0.0133 * W);
+    const LAMP_RING = Math.max(4, Math.round(0.0047 * W)); // how far out "surroundings" reaches
+
+    const blinkers = [];
+    machines.forEach((m, mi) => {
+      const bx0 = Math.round(m.col[0] * W);
+      const bx1 = Math.round(m.col[1] * W);
+      const by0 = Math.round(m.glass[3] * H);
+      const by1 = fTop;
+      const w = bx1 - bx0;
+      const h = by1 - by0;
+      if (w < 8 * LAMP_MIN || h < 8 * LAMP_MIN) return;
+
+      const face = medianColour(bx0, bx1, by0, by1, 1);
+      const faceLum = lumOf(face);
+
+      // Is this a cabinet at all? Mean neighbour-to-neighbour change over one
+      // art pixel: a painted panel barely changes, a rack of bottles never
+      // stops changing.
+      let churn = 0;
+      let churnN = 0;
+      for (let y = by0; y < by1 - LAMP_MIN; y++) {
+        for (let x = bx0; x < bx1 - LAMP_MIN; x++) {
+          const l = lumAt(x, y);
+          churn += Math.abs(lumAt(x + LAMP_MIN, y) - l) + Math.abs(lumAt(x, y + LAMP_MIN) - l);
+          churnN++;
+        }
+      }
+      if (churn / Math.max(1, churnN) > 0.085) return;
+
+      const lum = new Float32Array(w * h);
+      const gap = new Float32Array(w * h);
+      const sat = new Float32Array(w * h);
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          const i = ((y + by0) * W + (x + bx0)) * 4;
+          const j = y * w + x;
+          lum[j] = lumAt(x + bx0, y + by0);
+          gap[j] = hueGap(data[i], data[i + 1], data[i + 2]);
+          sat[j] = satAt(x + bx0, y + by0);
+        }
+      }
+
+      // Local background brightness, from a summed-area table so the window can
+      // be wide without costing anything.
+      const sums = new Float64Array((w + 1) * (h + 1));
+      for (let y = 0; y < h; y++) {
+        let run = 0;
+        for (let x = 0; x < w; x++) {
+          run += lum[y * w + x];
+          sums[(y + 1) * (w + 1) + x + 1] = sums[y * (w + 1) + x + 1] + run;
+        }
+      }
+      const near = new Float32Array(w * h);
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          const ax = Math.max(0, x - LAMP_NEAR);
+          const ay = Math.max(0, y - LAMP_NEAR);
+          const zx = Math.min(w, x + LAMP_NEAR + 1);
+          const zy = Math.min(h, y + LAMP_NEAR + 1);
+          near[y * w + x] =
+            (sums[zy * (w + 1) + zx] -
+              sums[ay * (w + 1) + zx] -
+              sums[zy * (w + 1) + ax] +
+              sums[ay * (w + 1) + ax]) /
+            ((zx - ax) * (zy - ay));
+        }
+      }
+
+      const lit = new Uint8Array(w * h);
+      for (let j = 0; j < w * h; j++) {
+        if (lum[j] >= near[j] + 0.05 && gap[j] >= 0.14 && sat[j] >= 0.35) lit[j] = 1;
+      }
+      // Grown by one art pixel before grouping, so the separate strokes of one
+      // readout join into a single lamp instead of blinking digit by digit.
+      const grown = new Uint8Array(w * h);
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          if (!lit[y * w + x]) continue;
+          for (let dy = -LAMP_GLUE; dy <= LAMP_GLUE; dy++) {
+            const yy = y + dy;
+            if (yy < 0 || yy >= h) continue;
+            for (let dx = -LAMP_GLUE; dx <= LAMP_GLUE; dx++) {
+              const xx = x + dx;
+              if (xx >= 0 && xx < w) grown[yy * w + xx] = 1;
+            }
+          }
+        }
+      }
+
+      const done = new Uint8Array(w * h);
+      const stack = [];
+      const kept = [];
+      const reach = (j) => {
+        if (!grown[j] || done[j]) return;
+        done[j] = 1;
+        stack.push(j);
+      };
+      for (let sy = 0; sy < h; sy++) {
+        for (let sx = 0; sx < w; sx++) {
+          const seed = sy * w + sx;
+          if (!grown[seed] || done[seed]) continue;
+          done[seed] = 1;
+          stack.length = 0;
+          stack.push(seed);
+          let gx0 = sx;
+          let gx1 = sx;
+          let gy0 = sy;
+          let gy1 = sy;
+          let blob = 0;
+          while (stack.length) {
+            const i = stack.pop();
+            const x = i % w;
+            const y = (i / w) | 0;
+            blob++;
+            if (x < gx0) gx0 = x;
+            if (x > gx1) gx1 = x;
+            if (y < gy0) gy0 = y;
+            if (y > gy1) gy1 = y;
+            if (x > 0) reach(i - 1);
+            if (x < w - 1) reach(i + 1);
+            if (y > 0) reach(i - w);
+            if (y < h - 1) reach(i + w);
+          }
+
+          // Shrink back onto what actually lit up: the grown mask found the
+          // group, the original one gives the lamp its edges.
+          let ax = gx1;
+          let zx = gx0;
+          let ay = gy1;
+          let zy = gy0;
+          let area = 0;
+          let gapSum = 0;
+          let liftSum = 0;
+          for (let y = gy0; y <= gy1; y++) {
+            for (let x = gx0; x <= gx1; x++) {
+              const i = y * w + x;
+              if (!lit[i]) continue;
+              area++;
+              gapSum += gap[i];
+              liftSum += lum[i] - near[i];
+              if (x < ax) ax = x;
+              if (x > zx) zx = x;
+              if (y < ay) ay = y;
+              if (y > zy) zy = y;
+            }
+          }
+          if (!area) continue;
+
+          const lw = zx - ax + 1;
+          const lh = zy - ay + 1;
+          // Anything against the edge of the band is only half measured: it
+          // runs on into the machine next door, or up behind the glass.
+          if (ax === 0 || ay === 0 || zx === w - 1 || zy === h - 1) continue;
+          if (lw < LAMP_MIN || lh < LAMP_MIN || lw > LAMP_MAX || lh > LAMP_MAX) continue;
+          if (area < LAMP_MIN * LAMP_MIN) continue;
+          if (blob / ((gx1 - gx0 + 1) * (gy1 - gy0 + 1)) < 0.55) continue;
+          const gapMean = gapSum / area;
+          const liftMean = liftSum / area;
+          if (gapMean < 0.17 || liftMean < 0.105) continue;
+
+          // The surroundings decide it: crowded with other bright specks means
+          // a shelf rather than a panel, and a surround no darker than the
+          // cabinet's face means the thing is stuck on the outside of it.
+          let crowd = 0;
+          let dark = 0;
+          let n = 0;
+          const rx0 = Math.max(0, ax - LAMP_RING);
+          const ry0 = Math.max(0, ay - LAMP_RING);
+          const rx1 = Math.min(w, zx + 1 + LAMP_RING);
+          const ry1 = Math.min(h, zy + 1 + LAMP_RING);
+          for (let y = ry0; y < ry1; y++) {
+            for (let x = rx0; x < rx1; x++) {
+              if (x >= ax && x <= zx && y >= ay && y <= zy) continue;
+              n++;
+              if (lit[y * w + x]) crowd++;
+              dark += lum[y * w + x];
+            }
+          }
+          if (crowd / Math.max(1, n) > 0.22) continue;
+          if (dark / Math.max(1, n) > faceLum * 0.9) continue;
+
+          kept.push({
+            machine: mi,
+            score: gapMean * liftMean * Math.sqrt(area),
+            rect: [ax + bx0, zx + bx0 + 1, ay + by0, zy + by0 + 1]
+          });
+        }
+      }
+
+      // Two lamps that all but touch are one fixture - the two halves of a
+      // credit readout - and giving them separate rhythms would show the seam
+      // between them.
+      for (const lamp of kept) {
+        const mate = blinkers.find(
+          (b) =>
+            b.machine === mi &&
+            b.rect[0] - LAMP_RING < lamp.rect[1] &&
+            b.rect[1] + LAMP_RING > lamp.rect[0] &&
+            b.rect[2] - LAMP_RING < lamp.rect[3] &&
+            b.rect[3] + LAMP_RING > lamp.rect[2]
+        );
+        if (mate) {
+          mate.rect[0] = Math.min(mate.rect[0], lamp.rect[0]);
+          mate.rect[1] = Math.max(mate.rect[1], lamp.rect[1]);
+          mate.rect[2] = Math.min(mate.rect[2], lamp.rect[2]);
+          mate.rect[3] = Math.max(mate.rect[3], lamp.rect[3]);
+          mate.score = Math.max(mate.score, lamp.score);
+        } else {
+          blinkers.push(lamp);
+        }
+      }
     });
+    blinkers.sort((a, b) => b.score - a.score);
 
     // -- the window: where snow is allowed to fall ---------------------------
     //
@@ -500,7 +896,7 @@
     const MH = 320;
     const winTop = (tBot + 6) / H;
     const winBot = (gTop - 8) / H;
-    const winLeft = machines.length ? machines[0][0] / W : 0;
+    const winLeft = machineCols.length ? machineCols[0][0] / W : 0;
 
     const raw = new Uint8Array(MW * MH);
     for (let cy = 0; cy < MH; cy++) {
@@ -544,13 +940,13 @@
     return {
       width: W,
       height: H,
-      glassBand: [gTop / H, gBot / H],
       floorBand: [fTop / H, fBot / H],
-      tubeBand: [tTop / H, tBot / H],
-      panelBand: [gBot / H, fTop / H],
-      machineTints: tints,
-      machines: machines.map(([a, b]) => [a / W, b / W]),
-      tubes: tubes.map(([a, b]) => [a / W, b / W]),
+      machines,
+      tubes,
+      blinkers: blinkers.map((b) => ({
+        machine: b.machine,
+        rect: [b.rect[0] / W, b.rect[1] / W, b.rect[2] / H, b.rect[3] / H]
+      })),
       window: { mw: MW, mh: MH, mask, top: winTop, bottom: winBot, left: winLeft }
     };
   }
@@ -593,8 +989,15 @@
    * One machine, picked by the seed rather than named, has a failing tube: a
    * permanent faint unsteadiness, and every several seconds a slow visible
    * flutter that no other machine does.
+   *
+   * Indicator lamps: one slow swell each, several seconds long, eased at both
+   * ends so the lamp arrives at bright and at dim rather than arriving at a
+   * corner. Every lamp draws its own period and its own phase, so no two are
+   * ever together and the row never pulses as one. The swing is small on
+   * purpose - these are lamps the size of a fingernail and the point is that
+   * you notice them only once you look.
    */
-  function createLights(props, machineCount, tubeCount) {
+  function createLights(props, machineCount, tubeCount, blinkCount) {
     const seed = Math.round(num(props.seed, 7));
     const rnd = mulberry32(seed * 2654435761);
 
@@ -660,8 +1063,25 @@
       failTable[i] = r < 0.34 ? 1 : r < 0.58 ? 0.45 : 0;
     }
 
+    // Drawn after the machines and tubes so that adding a lamp cannot reshuffle
+    // which machine has the failing tube: this PRNG is one stream and every
+    // draw moves it on.
+    const blinkPeriod = Math.max(0.8, num(props.blinkPeriod, 4.6));
+    const blinkJitter = Math.max(0, num(props.blinkJitter, 2));
+    const blinkDepth = num(props.blinkDepth, 0.11);
+    const blinks = [];
+    for (let i = 0; i < blinkCount; i++) {
+      const period = Math.max(0.8, blinkPeriod + (rnd() * 2 - 1) * blinkJitter);
+      blinks.push({
+        rate: TAU / period,
+        phase: rnd() * TAU,
+        depth: blinkDepth * (0.78 + 0.44 * rnd())
+      });
+    }
+
     const machineLevels = new Float32Array(machineCount);
     const tubeLevels = new Float32Array(tubeCount);
+    const blinkLevels = new Float32Array(blinkCount);
 
     function step(t) {
       for (let i = 0; i < machineCount; i++) {
@@ -694,175 +1114,19 @@
         }
         tubeLevels[i] = level;
       }
-    }
 
-    return { step, machineLevels, tubeLevels };
-  }
-
-  // ===========================================================================
-  // The lamps on the machines
-  // ===========================================================================
-
-  /**
-   * The small lights on the machines themselves: a rail of selection buttons
-   * under each glass front, and a coin-slot indicator beside it.
-   *
-   * These are drawn rather than measured, because the plate does not contain
-   * them - but nothing here is hand-placed either. Every position is a
-   * fraction of the machine's own measured span and of the panel band below
-   * its glass, so seven machines of four different widths each get a rail that
-   * fits them, and repainting the plate moves the lights with the machines.
-   *
-   * Two rules come straight from the art. Whole art pixels only, like the
-   * snow: a lamp is a square on the pixel grid, never a fractional rect the
-   * rasteriser will feather. And the glow is concentric hard squares at
-   * falling alpha rather than a radial gradient - soft falloff over pixel art
-   * reads as a smudge on the screen instead of a light in the picture.
-   * Compositing them additively is what makes them read as emitting rather
-   * than as paint.
-   */
-  function createLamps(canvas, plate, props) {
-    const ctx = canvas.getContext('2d');
-    const ART_W = plate.width;
-    const ART_H = plate.height;
-
-    const panelTopArt = plate.panelBand[0] * ART_H;
-    const panelBotArt = plate.panelBand[1] * ART_H;
-    const panelH = Math.max(1, panelBotArt - panelTopArt);
-
-    const size = Math.max(1, Math.round(num(props.lampSize, 5)));
-    const glow = Math.max(0, num(props.lampGlow, 0.55));
-    const bright = clamp01(num(props.lampBright, 0.85));
-    const blinkShare = clamp01(num(props.lampBlinkShare, 0.34));
-    const blinkRate = num(props.lampBlinkRate, 1);
-    const pulseDepth = num(props.lampPulseDepth, 0.22);
-    const pulseRate = num(props.lampPulseRate, 1);
-    const rowAt = num(props.lampRow, 0.1);
-    const spacing = Math.max(6, num(props.lampSpacing, 26));
-    const coinAt = nums(props.lampCoin, [0.8, 0.42]);
-    const idle = clamp01(num(props.lampIdle, 0.12));
-
-    const rnd = mulberry32(Math.round(num(props.seed, 7)) * 668265263 + 11);
-
-    const lamps = [];
-    const addLamp = (x, y, machine, tint, forceBlink, scale) => {
-      const blink = forceBlink || rnd() < blinkShare;
-      lamps.push({
-        x: x,
-        y: y,
-        machine: machine,
-        tint: tint,
-        scale: scale,
-        blink: blink,
-        // Blinkers run at a visible fraction of a second; the steady ones
-        // breathe over ten or twenty, slow enough never to pull the eye.
-        rate: blink
-          ? TAU * blinkRate * (0.35 + 0.9 * rnd())
-          : TAU * pulseRate * (0.05 + 0.12 * rnd()),
-        phase: rnd() * TAU,
-        // Above this the lamp is on. Off-centre thresholds give the short
-        // flashes that stop a rail of them beating like a metronome.
-        threshold: rnd() < 0.4 ? 0.45 : 0,
-        alpha: bright * (0.62 + 0.5 * rnd())
-      });
-    };
-
-    plate.machines.forEach((span, mi) => {
-      const x0 = span[0] * ART_W;
-      const x1 = span[1] * ART_W;
-      const w = x1 - x0;
-      const tint = (plate.machineTints && plate.machineTints[mi]) || [226, 238, 255];
-
-      // Inset from the bezels, then as many buttons as the machine is wide
-      // enough to hold at the given spacing.
-      const inset = w * 0.15;
-      const usable = Math.max(1, w - inset * 2);
-      const count = Math.max(2, Math.min(8, Math.round(usable / spacing)));
-      for (let i = 0; i < count; i++) {
-        addLamp(
-          x0 + inset + (usable * i) / (count - 1),
-          panelTopArt + panelH * rowAt,
-          mi,
-          tint,
-          false,
-          1
-        );
+      for (let i = 0; i < blinkCount; i++) {
+        const b = blinks[i];
+        const swing = 0.5 + 0.5 * Math.sin(t * b.rate + b.phase);
+        // Smoothstep, not the raw sine: it lingers at each end of the swing, so
+        // the lamp reads as holding bright and holding dim rather than sliding
+        // continuously between the two.
+        const eased = swing * swing * (3 - 2 * swing);
+        blinkLevels[i] = 1 - b.depth + 2 * b.depth * eased;
       }
-
-      // The coin/vend indicator: always blinking, and bigger than a button.
-      addLamp(x0 + w * coinAt[0], panelTopArt + panelH * coinAt[1], mi, tint, true, 1.4);
-    });
-
-    let width = 1;
-    let height = 1;
-    let unit = 1; // screen pixels per art pixel
-    let originX = 0;
-    let originY = 0; // art origin relative to the TOP OF THIS CANVAS
-
-    /** The same cover fit the shader and the snow use. This canvas only has to
-        cover the panel band, plus room for the widest halo. */
-    function layout(w, h) {
-      const screenAspect = w / h;
-      const imageAspect = ART_W / ART_H;
-      const sx = screenAspect > imageAspect ? 1 : screenAspect / imageAspect;
-      unit = w / sx / ART_W;
-      originX = w / 2 - (ART_W / 2) * unit;
-      const artTop = h / 2 - (ART_H / 2) * unit;
-
-      const pad = Math.round(size * 4 * unit) + 2;
-      const top = Math.max(0, Math.round(artTop + panelTopArt * unit) - pad);
-      const bottom = Math.min(h, Math.round(artTop + panelBotArt * unit) + pad);
-      originY = artTop - top;
-      width = w;
-      height = Math.max(1, bottom - top);
-      return { top: top, height: height };
     }
 
-    const rgba = (tint, a) => 'rgba(' + tint[0] + ', ' + tint[1] + ', ' + tint[2] + ', ' + a + ')';
-
-    function drawLamp(lamp, a) {
-      if (a <= 0.004) return;
-      const px = Math.max(1, Math.round(size * lamp.scale * unit));
-      const x = Math.round(originX + lamp.x * unit);
-      const y = Math.round(originY + lamp.y * unit);
-
-      // Halo first: two hard squares around the core, each dimmer than the last.
-      for (let ring = 2; ring >= 1; ring--) {
-        const grow = px * ring;
-        ctx.fillStyle = rgba(lamp.tint, a * glow * (ring === 2 ? 0.11 : 0.26));
-        ctx.fillRect(x - grow, y - grow, px + grow * 2, px + grow * 2);
-      }
-      ctx.fillStyle = rgba(lamp.tint, a);
-      ctx.fillRect(x, y, px, px);
-    }
-
-    /**
-     * `levels` is the per-machine brightness the shader is using this frame, so
-     * a machine's buttons sag and flutter with the machine they are bolted to,
-     * the failing one included.
-     */
-    function draw(time, levels) {
-      ctx.clearRect(0, 0, width, height);
-      // Additive: a light adds to what is behind it. Over the dark control
-      // panel that is what separates a lamp from a painted dot.
-      ctx.globalCompositeOperation = 'lighter';
-      for (const lamp of lamps) {
-        const level = levels && levels.length > lamp.machine ? levels[lamp.machine] : 1;
-        let a = lamp.alpha * level;
-        if (lamp.blink) {
-          const on = Math.sin(time * lamp.rate + lamp.phase) > lamp.threshold;
-          // Never all the way out: an unlit indicator still catches the light
-          // of the machine it sits on, and blinking to pure black strobes.
-          a *= on ? 1 : idle;
-        } else {
-          a *= 1 + pulseDepth * Math.sin(time * lamp.rate + lamp.phase);
-        }
-        drawLamp(lamp, clamp01(a));
-      }
-      ctx.globalCompositeOperation = 'source-over';
-    }
-
-    return { layout: layout, draw: draw };
+    return { step, machineLevels, tubeLevels, blinkLevels };
   }
 
   // ===========================================================================
@@ -1102,42 +1366,83 @@
     gl.uniform1i(u('uImage'), 0);
     gl.uniform1f(u('uImageAspect'), plate.width / plate.height);
     gl.uniform2f(u('uPlate'), plate.width, plate.height);
-    gl.uniform2f(u('uGlassBand'), plate.glassBand[0], plate.glassBand[1]);
     gl.uniform2f(u('uFloorBand'), plate.floorBand[0], plate.floorBand[1]);
-    gl.uniform2f(u('uTubeBand'), plate.tubeBand[0], plate.tubeBand[1]);
 
-    const glassLevels = nums(properties.glassLevels, [0.22, 0.4]);
-    const floorLevels = nums(properties.floorLevels, [0.16, 0.34]);
-    const tubeLevels = nums(properties.tubeLevels, [0.24, 0.4]);
-    gl.uniform2f(u('uGlassLevels'), glassLevels[0], glassLevels[1]);
-    gl.uniform2f(u('uFloorLevels'), floorLevels[0], floorLevels[1]);
-    gl.uniform2f(u('uTubeLevels'), tubeLevels[0], tubeLevels[1]);
-    gl.uniform1f(u('uFloorGain'), num(properties.floorGain, 0.9));
+    // How far each light fades out at its edge. Wide enough that the rectangle
+    // never reads as a rectangle, narrow enough that a machine's glow stops at
+    // its own bezel instead of washing over its neighbour.
+    const glassFeather = nums(properties.glassFeather, [0.005, 0.008]);
+    const tubeFeather = nums(properties.tubeFeather, [0.008, 0.004]);
+    // A lamp is smaller than the other lights by an order of magnitude, so its
+    // feather has to be too: the glass feather alone is wider than most of them.
+    const blinkFeather = nums(properties.blinkFeather, [0.002, 0.003]);
+    const bloomLevels = nums(properties.bloomLevels, [0.45, 0.78]);
+    gl.uniform2f(u('uGlassFeather'), glassFeather[0], glassFeather[1]);
+    gl.uniform2f(u('uTubeFeather'), tubeFeather[0], tubeFeather[1]);
+    gl.uniform2f(u('uBlinkFeather'), blinkFeather[0], blinkFeather[1]);
+    gl.uniform2f(u('uBloomLevels'), bloomLevels[0], bloomLevels[1]);
+    gl.uniform1f(u('uFloorFeather'), num(properties.floorFeather, 0.02));
+    gl.uniform1f(u('uFloorGain'), num(properties.floorGain, 0.5));
     gl.uniform1f(u('uFloorWobble'), num(properties.floorWobble, 1.8));
     gl.uniform1f(u('uFloorWobbleRate'), num(properties.floorWobbleRate, 1));
     gl.uniform1f(u('uBloom'), num(properties.bloom, 0.1));
 
-    // xy = span, z = level. Only z changes per frame, so the whole array goes
-    // up in one call and the spans never have to be re-sent.
-    const machineData = new Float32Array(MAX_MACHINES * 4);
-    plate.machines.forEach((span, i) => {
-      machineData[i * 4] = span[0];
-      machineData[i * 4 + 1] = span[1];
-      machineData[i * 4 + 2] = 1;
+    // Only the levels change per frame, so the footprints go up once here and
+    // the levels go up as their own array.
+    const machineGlass = new Float32Array(MAX_MACHINES * 4);
+    const machineCol = new Float32Array(MAX_MACHINES * 2);
+    const machineLevel = new Float32Array(MAX_MACHINES).fill(1);
+    plate.machines.forEach((m, i) => {
+      machineGlass.set(m.glass, i * 4);
+      machineCol.set(m.col, i * 2);
     });
-    const tubeData = new Float32Array(MAX_TUBES * 4);
-    plate.tubes.forEach((span, i) => {
-      tubeData[i * 4] = span[0];
-      tubeData[i * 4 + 1] = span[1];
-      tubeData[i * 4 + 2] = 1;
+    const tubeRect = new Float32Array(MAX_TUBES * 4);
+    const tubeLevel = new Float32Array(MAX_TUBES).fill(1);
+    plate.tubes.forEach((t, i) => tubeRect.set(t, i * 4));
+
+    // The strongest few lamps, and no more than a couple off any one machine,
+    // so a machine with a busy panel cannot take over the row. They arrive
+    // ranked, so this keeps the best of them wherever they are.
+    const perMachine = Math.max(0, Math.round(num(properties.blinkPerMachine, 2)));
+    const taken = new Map();
+    const blinkers = [];
+    for (const b of plate.blinkers) {
+      if (blinkers.length >= MAX_BLINKERS) break;
+      const n = taken.get(b.machine) || 0;
+      if (n >= perMachine) continue;
+      taken.set(b.machine, n + 1);
+      blinkers.push(b);
+    }
+
+    // Padded by the feather, so the ramp falls on the housing outside the lamp
+    // and the lamp itself swings at the full level. Without this a lamp four
+    // art pixels wide would be all edge.
+    const blinkRect = new Float32Array(MAX_BLINKERS * 4);
+    const blinkLevel = new Float32Array(MAX_BLINKERS).fill(1);
+    blinkers.forEach((b, i) => {
+      blinkRect.set(
+        [
+          b.rect[0] - blinkFeather[0],
+          b.rect[1] + blinkFeather[0],
+          b.rect[2] - blinkFeather[1],
+          b.rect[3] + blinkFeather[1]
+        ],
+        i * 4
+      );
     });
+
     gl.uniform1i(u('uMachineCount'), plate.machines.length);
     gl.uniform1i(u('uTubeCount'), plate.tubes.length);
-    const uMachine = u('uMachine');
-    const uTube = u('uTube');
+    gl.uniform1i(u('uBlinkCount'), blinkers.length);
+    gl.uniform4fv(u('uMachineGlass'), machineGlass);
+    gl.uniform2fv(u('uMachineCol'), machineCol);
+    gl.uniform4fv(u('uTubeRect'), tubeRect);
+    gl.uniform4fv(u('uBlinkRect'), blinkRect);
+    const uMachineLevel = u('uMachineLevel');
+    const uTubeLevel = u('uTubeLevel');
+    const uBlinkLevel = u('uBlinkLevel');
 
-    const lights = createLights(properties, plate.machines.length, plate.tubes.length);
-    const lamps = createLamps(lampCanvas, plate, properties);
+    const lights = createLights(properties, plate.machines.length, plate.tubes.length, blinkers.length);
     const snow = createSnow(fxCanvas, plate, properties);
     const uResolution = u('uResolution');
     const uTime = u('uTime');
@@ -1158,13 +1463,6 @@
       fxCanvas.style.top = rect.top / dpr + 'px';
       fxCanvas.style.width = w / dpr + 'px';
       fxCanvas.style.height = rect.height / dpr + 'px';
-
-      const lampRect = lamps.layout(w, h);
-      lampCanvas.width = w;
-      lampCanvas.height = lampRect.height;
-      lampCanvas.style.top = lampRect.top / dpr + 'px';
-      lampCanvas.style.width = w / dpr + 'px';
-      lampCanvas.style.height = lampRect.height / dpr + 'px';
     }
     resize();
     window.addEventListener('resize', resize);
@@ -1180,19 +1478,14 @@
       clock += dt;
 
       lights.step(clock);
-      for (let i = 0; i < lights.machineLevels.length; i++) {
-        machineData[i * 4 + 2] = lights.machineLevels[i];
-      }
-      for (let i = 0; i < lights.tubeLevels.length; i++) {
-        tubeData[i * 4 + 2] = lights.tubeLevels[i];
-      }
-      gl.uniform4fv(uMachine, machineData);
-      gl.uniform4fv(uTube, tubeData);
+      machineLevel.set(lights.machineLevels);
+      tubeLevel.set(lights.tubeLevels);
+      blinkLevel.set(lights.blinkLevels);
+      gl.uniform1fv(uMachineLevel, machineLevel);
+      gl.uniform1fv(uTubeLevel, tubeLevel);
+      gl.uniform1fv(uBlinkLevel, blinkLevel);
       gl.uniform1f(uTime, clock);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
-
-      // Lamps under the snow, so a flake crosses in front of a lit button.
-      lamps.draw(clock, lights.machineLevels);
 
       snow.update(dt, clock);
       snow.draw(clock);
