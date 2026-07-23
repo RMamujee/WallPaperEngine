@@ -45,6 +45,25 @@
    *   - the overlay owns everything that is not in the plate: rain, splashes,
    *     the traffic light lamps, the taxi and its passenger
    *
+   * It also listens. Each frequency band drives whatever in this scene would
+   * really be making that sound, so the response reads as coming FROM the
+   * corner rather than being laid over it:
+   *
+   *   - LOWS shake the standing water, because bass is the band you feel
+   *     through the ground and wet asphalt is the only surface here that shows
+   *     it (see uWaterGain)
+   *   - MIDS lift the kiosk, because voices and melody live in the mids and the
+   *     kiosk is where the people are (see uGlow)
+   *   - HIGHS drive the rain, because a hi-hat and a rain shower are the same
+   *     fine, fast, bright thing in two different media (see trebleRain)
+   *
+   * Two rules hold that together. The huge blue wall is the subject of this
+   * painting and NOTHING is allowed to touch it - which is also why every
+   * response is confined to the bottom right, where all the content already
+   * is. And the traffic light keeps its own clock precisely because everything
+   * else is reacting: it is the civic anchor that keeps the corner believable,
+   * and a signal that danced to music would turn the piece into a cartoon.
+   *
    * All geometry is written in *plate pixels* against the 2560x1600 artwork
    * (see ART_W/ART_H), because every position here was measured off the plate.
    * A single `unit` converts those to screen pixels; the cover fit guarantees
@@ -87,6 +106,9 @@
   uniform float uRipple;       // expanding-ring displacement
   uniform float uRippleRate;
   uniform float uShimmer;      // brightness breathing on reflected light
+  uniform float uWaterGain;    // lows: how much harder the water is working
+  uniform float uGlow;         // mids: lift on the kiosk's own light
+  uniform vec2  uGlowX;        // the kiosk's column, in image UV
 
   /** Screen UV -> image UV for a cover (crop) fit. The plate is 16:10 like the
       target display, so in practice this is close to the identity. */
@@ -154,6 +176,13 @@
       offset += ripples(base, 34.0, 0.55, 0.0) * uRipple * near;
       offset += ripples(base, 19.0, 0.33, 4.7) * uRipple * near * 1.5;
 
+      // The lows arrive here, as amplitude rather than as anything new: low
+      // frequencies are what you feel through the ground, and standing water is
+      // the one surface in this frame that shows them. Scaling the existing
+      // displacement means bass makes the reflection work harder, and silence
+      // leaves the water exactly as it was designed to sit.
+      offset *= 1.0 + uWaterGain;
+
       color = texture(uImage, clamp(base + offset * road, 0.0, 1.0)).rgb;
 
       // A reflection on broken water loses and regains brightness as the
@@ -161,6 +190,23 @@
       float shimmer = sin(base.x * 96.0 - uTime * 1.7) * sin(base.y * 90.0 + uTime * 0.9);
       color *= 1.0 + uShimmer * warm * road * shimmer;
     }
+
+    // -- mids: the kiosk ------------------------------------------------------
+    //
+    // Voices and melody live in the mids, and the kiosk is where the people in
+    // this picture are, so the shopfront is what should carry them. It is also
+    // the only warm thing in a frame of blue, which means gating on warmth
+    // alone reaches the window, the awning, the spill on the pavement and the
+    // reflection lying in the road - and leaves the vast blue wall, which is
+    // the actual subject of the painting, completely untouched.
+    //
+    // The column bound is what keeps this honest. Warmth alone would also catch
+    // the taxi and the traffic light, and a traffic light that answers to music
+    // stops reading as a street.
+    float warmth = smoothstep(0.04, 0.30, color.r - color.b * 0.55);
+    float column = smoothstep(uGlowX.x - 0.035, uGlowX.x + 0.012, base.x)
+                 * (1.0 - smoothstep(uGlowX.y - 0.012, uGlowX.y + 0.035, base.x));
+    color *= 1.0 + uGlow * warmth * column;
 
     fragColor = vec4(color, 1.0);
   }`;
@@ -242,6 +288,128 @@
   const rgba = (c, a) => `rgba(${c[0]}, ${c[1]}, ${c[2]}, ${a})`;
   const lerp = (a, b, t) => a + (b - a) * t;
   const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+
+  // ---------------------------------------------------------------------------
+  // Sound
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Turns the three raw band energies from the host into something worth
+   * animating. Each band then drives the part of the scene that would really
+   * make that sound: lows the standing water, mids the kiosk, highs the rain.
+   *
+   * Almost none of the work here is the mapping. It is these three, and each is
+   * the difference between answering the music and answering the volume knob:
+   *
+   *   - AUTO GAIN. bass/mid/treble arrive as absolute energies, so at a low
+   *     system volume nothing moves at all and at a high one everything sits
+   *     pinned at full. Each band is divided by its own slowly decaying running
+   *     peak, so what comes out is how loud this moment is against the last few
+   *     seconds rather than how loud it is in absolute terms.
+   *   - ASYMMETRIC SLEW. Fast up, slow down, because that is the shape of very
+   *     nearly every sound: a transient arrives at once and then decays. One
+   *     symmetric filter can be jittery or smeared but never neither.
+   *   - SILENCE. This sits behind the desktop around the clock and most of that
+   *     time nothing is playing. When the input dies the whole response fades
+   *     out and hands the scene back to its own scripted animation, instead of
+   *     freezing at whatever value it was holding when the music stopped.
+   *
+   * Time constants are in seconds and converted per frame, so none of the feel
+   * changes with the frame rate.
+   */
+  function createAudio(props) {
+    const BANDS = ['bass', 'mid', 'treble'];
+    const attack = Math.max(0.001, num(props.audioAttack, 0.05));
+    const release = Math.max(0.001, num(props.audioRelease, 0.45));
+    const peakFall = Math.max(0.5, num(props.audioPeakFall, 12));
+    const noiseFloor = Math.max(1e-4, num(props.audioFloor, 0.006));
+    const gate = Math.max(1e-4, num(props.audioGate, 0.02));
+
+    const level = { bass: 0, mid: 0, treble: 0 };
+    const peak = { bass: noiseFloor, mid: noiseFloor, treble: noiseFloor };
+    const out = { bass: 0, mid: 0, treble: 0 };
+    let awake = 0;
+
+    // The fraction of the way to a target that one frame of dt covers, for a
+    // filter with time constant tau.
+    const approach = (cur, target, dt, tau) => cur + (target - cur) * (1 - Math.exp(-dt / tau));
+
+    function step(dt) {
+      const data = window.wallpaperForge ? window.wallpaperForge.frame() : null;
+      const audio = (data && data.audio) || null;
+      let loudest = 0;
+
+      for (const band of BANDS) {
+        const raw = audio ? Math.max(0, num(audio[band], 0)) : 0;
+        if (raw > loudest) loudest = raw;
+
+        // The peak climbs over a fifth of a second rather than instantly, so a
+        // single stray sample cannot duck the whole scene for the next ten.
+        peak[band] =
+          raw > peak[band]
+            ? approach(peak[band], raw, dt, 0.2)
+            : Math.max(noiseFloor, peak[band] * Math.exp(-dt / peakFall));
+
+        // Squaring pulls the low hiss of a quiet passage down without touching
+        // the peaks, which is what keeps a still room still.
+        const norm = clamp01(raw / peak[band]);
+        const shaped = norm * norm;
+        level[band] = approach(level[band], shaped, dt, shaped > level[band] ? attack : release);
+      }
+
+      // Waking is quick, sleeping is slow: the gap between two tracks should not
+      // drain the scene, but closing the music should let it settle back.
+      awake = approach(awake, loudest > gate ? 1 : 0, dt, loudest > gate ? 0.3 : 2.5);
+      for (const band of BANDS) out[band] = level[band] * awake;
+    }
+
+    return { step, level: out };
+  }
+
+  /**
+   * The kiosk's column, measured off the plate rather than typed in.
+   *
+   * The shopfront is the only large warm thing in a frame that is otherwise
+   * entirely blue, so totalling warmth per column above the road finds it on
+   * its own. The taxi and the traffic light are warm too, but they are small
+   * and there is dark pavement either side of the kiosk, so the run around the
+   * peak stops well short of both.
+   *
+   * The warm test is deliberately the same one the shader uses, so the column
+   * this returns and the mask it bounds cannot disagree.
+   */
+  function findGlowColumn(image, roadY) {
+    const W = 256;
+    const H = 160;
+    const canvas = document.createElement('canvas');
+    canvas.width = W;
+    canvas.height = H;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(image, 0, 0, W, H);
+    const px = ctx.getImageData(0, 0, W, H).data;
+
+    const bottom = Math.max(1, Math.min(H, Math.round(roadY * H)));
+    const cols = new Float32Array(W);
+    for (let x = 0; x < W; x++) {
+      let sum = 0;
+      for (let y = 0; y < bottom; y++) {
+        const i = (y * W + x) * 4;
+        sum += Math.max(0, (px[i] - px[i + 2] * 0.55) / 255);
+      }
+      cols[x] = sum;
+    }
+
+    let best = 0;
+    for (let x = 1; x < W; x++) if (cols[x] > cols[best]) best = x;
+    if (cols[best] <= 0) return [0, 0];
+
+    const cut = cols[best] * 0.18;
+    let a = best;
+    let b = best;
+    while (a > 0 && cols[a - 1] > cut) a--;
+    while (b < W - 1 && cols[b + 1] > cut) b++;
+    return [a / W, (b + 1) / W];
+  }
   const smooth = (a, b, t) => {
     const x = clamp01((t - a) / (b - a));
     return x * x * (3 - 2 * x);
@@ -339,6 +507,15 @@
     const rainSpeed = num(props.rainSpeed, 1);
     const rainOpacity = num(props.rainOpacity, 1);
     const splashChance = clamp01(num(props.splashChance, 0.45));
+
+    // Highs: the rain. Rain is already the fine, fast, bright thing in this
+    // frame and a hi-hat is the fine, fast, bright thing in a mix, so the two
+    // line up without having to be told to. Brightness and how readily a drop
+    // breaks on landing - not speed, which would read as wind, and wind is not
+    // a thing sound does.
+    const rainLift = Math.max(0, num(props.trebleRain, 0.85));
+    const splashLift = Math.max(0, num(props.trebleSplash, 1.1));
+    let treble = 0;
     const cabEnabled = props.cabEnabled !== false;
     const cabStopX = num(props.cabStopX, 0.7942) * ART_W;
     const cabGroundY = num(props.cabGroundY, 0.89) * ART_H;
@@ -608,12 +785,14 @@
       }
     }
 
-    function update(dt) {
+    function update(dt, audio) {
+      treble = audio ? clamp01(audio.treble) : 0;
       stepLight(dt);
       stepCab(dt);
       stepPed(dt);
 
       const lampColor = LIGHT.color[lampName];
+      const splashOdds = clamp01(splashChance * (1 + treble * splashLift));
       for (const layer of layers) {
         const { spec } = layer;
         const vy = spec.speed * rainSpeed * dt;
@@ -622,7 +801,7 @@
           layer.y[i] += vy;
           layer.x[i] += vx;
           if (layer.y[i] >= layer.gy[i]) {
-            if (spec.ground && Math.random() < splashChance) {
+            if (spec.ground && Math.random() < splashOdds) {
               addSplash(layer.x[i], layer.gy[i], 0.6 + (layer.gy[i] - 1400) / 150, lampColor);
             }
             spawn(layer, i, true);
@@ -653,7 +832,7 @@
         }
         // One stroke per layer: overlapping streaks inside a single path
         // composite once, so the rain never bunches into bright knots.
-        ctx.strokeStyle = rgba([196, 222, 246], Math.min(1, spec.alpha * rainOpacity));
+        ctx.strokeStyle = rgba([196, 222, 246], Math.min(1, spec.alpha * rainOpacity * (1 + treble * rainLift)));
         ctx.lineWidth = Math.max(1, spec.width * unit);
         ctx.stroke();
       }
@@ -1011,17 +1190,32 @@
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
 
     const u = (name) => gl.getUniformLocation(program, name);
-    const uniforms = { resolution: u('uResolution'), time: u('uTime') };
+    const uniforms = {
+      resolution: u('uResolution'),
+      time: u('uTime'),
+      waterGain: u('uWaterGain'),
+      glow: u('uGlow')
+    };
+
+    const roadY = num(properties.roadY, 0.884);
+    const glowX = findGlowColumn(image, roadY);
 
     gl.uniform1i(u('uImage'), 0);
     gl.uniform1f(u('uImageAspect'), image.width / image.height);
-    gl.uniform1f(u('uRoadY'), num(properties.roadY, 0.884));
+    gl.uniform1f(u('uRoadY'), roadY);
+    gl.uniform2f(u('uGlowX'), glowX[0], glowX[1]);
     gl.uniform1f(u('uWobble'), 0.0016 * num(properties.wobbleStrength, 1));
     gl.uniform1f(u('uRipple'), 0.0013 * num(properties.rippleStrength, 1));
     gl.uniform1f(u('uRippleRate'), num(properties.rippleRate, 1));
     gl.uniform1f(u('uShimmer'), 0.2 * num(properties.shimmerStrength, 1));
 
     const overlay = createOverlay(fxCanvas, image, properties);
+    const audio = createAudio(properties);
+    // How far each band is allowed to push its own part of the scene. Kept low
+    // on purpose: the auto gain already guarantees the loud moments reach the
+    // top of this range, so anything larger only makes the quiet ones noisy.
+    const bassWater = Math.max(0, num(properties.bassWater, 0.9));
+    const midGlow = Math.max(0, num(properties.midGlow, 0.16));
 
     function resize() {
       const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -1048,10 +1242,13 @@
       last = now;
       clock += dt;
 
+      audio.step(dt);
       gl.uniform1f(uniforms.time, clock);
+      gl.uniform1f(uniforms.waterGain, audio.level.bass * bassWater);
+      gl.uniform1f(uniforms.glow, audio.level.mid * midGlow);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
 
-      overlay.update(dt);
+      overlay.update(dt, audio.level);
       overlay.draw(clock);
     }
 
