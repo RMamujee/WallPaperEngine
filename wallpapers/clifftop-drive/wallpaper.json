@@ -1,0 +1,76 @@
+{
+  "name": "Clifftop Drive",
+  "type": "web",
+  "entry": "index.html",
+  "description": "Painted coast road: cumulus towers drifting over a summer sky, wildflower grass breathing in travelling gusts, swell and surf working the cliff base, butterflies and seed fluff over the meadow, gulls crossing now and then - and the Jeep parked dead still",
+  "preview": "media/plate.png",
+  "audio": false,
+  "cursor": true,
+  "properties": {
+    "plate": "media/plate.png",
+
+    "fit": "cover",
+    "focus": [0.5, 0.5],
+    "blurLod": 7.6,
+    "blurDim": 0.68,
+    "blurDesat": 0.14,
+
+    "maskLod": 3,
+    "cloudLod": 4.5,
+    "horizon": 0.6,
+
+    "wind": 0.0052,
+    "windDepth": 1.05,
+    "windSpeed": 1.15,
+    "gustAngle": 335,
+    "gustLength": 0.78,
+    "gustSpeed": 0.4,
+    "gustDepth": 0.72,
+    "vegGate": [0.06, 0.2],
+    "vegWarm": [0.05, 0.16],
+    "jeep": [0.454, 0.677, 0.593, 0.852],
+    "jeepFeather": 0.024,
+
+    "swellAngle": 62,
+    "swell": 0.0021,
+    "swellLength": 0.14,
+    "swellSpeed": 0.038,
+    "surfLength": 0.1,
+    "surfSpeed": 0.03,
+    "surfGain": 0.44,
+    "waterEdge": [0.34, 0.44],
+    "seaGate": [0.04, 0.12],
+    "seaLum": [0.28, 0.4],
+    "foamLum": [0.6, 0.88],
+
+    "cloudDrift": 0.0062,
+    "cloudDriftSpeed": 1.9,
+    "cloudBillow": 0.0034,
+    "cloudBillowSpeed": 2.1,
+    "cloudLum": [0.62, 0.88],
+    "skyFade": [0.36, 0.47],
+    "skySeaFade": [0.52, 0.62],
+    "skySplit": [0.3, 0.62],
+
+    "birds": 2,
+    "birdGap": [14, 38],
+    "birdBand": [0.1, 0.38],
+    "birdSpeed": 0.55,
+    "birdSize": 1.25,
+
+    "butterflies": 4,
+    "butterflyBand": [0.64, 0.73, 0.99, 0.94],
+    "butterflySize": 1,
+    "butterflySpeed": 1,
+
+    "motes": 22,
+    "moteBand": [0.3, 0.862, 0.99, 0.962],
+    "moteSize": 1,
+    "moteSpeed": 1,
+
+    "parallax": 0.002,
+    "vignette": 0.05,
+    "saturate": 1,
+    "brightness": 1
+  }
+}

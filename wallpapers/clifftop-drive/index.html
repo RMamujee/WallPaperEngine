@@ -1,0 +1,1192 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Clifftop Drive</title>
+<style>
+  html,
+  body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #0b2f52;
+  }
+  canvas {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+  #error {
+    position: fixed;
+    inset: 0;
+    display: none;
+    place-content: center;
+    font: 500 15px/1.6 system-ui, sans-serif;
+    color: #8b93a7;
+    text-align: center;
+    padding: 8vh 10vw;
+  }
+</style>
+<canvas id="gl"></canvas>
+<canvas id="fx"></canvas>
+<div id="error"></div>
+
+<script>
+  /**
+   * Clifftop Drive: a painted coast road animated in place.
+   *
+   * The plate is 2560x1600 - 16:10 LANDSCAPE, which is exactly the shape of the
+   * desktop it hangs on, so the framing problem the earlier portrait plate had
+   * is simply gone:
+   *
+   *   - fit is "cover", focus [0.5, 0.5]. On a 1920x1200 monitor that is a
+   *     one-to-one fit with no crop at all; on 1920x1080 it trims a symmetric
+   *     five percent off the top and the bottom, which costs plain blue sky and
+   *     a strip of foreground grass and nothing else. focus MUST stay at 0.5:
+   *     when the plate and the screen share an aspect, coverUv's scale is
+   *     (1, 1) and any other focus slides the whole painting off the edge
+   *   - "contain" and "blur" still work for odd screens. blurLod is 7.6 rather
+   *     than the 5.8 the 736-wide plate wanted: the LOD that reads as "blurred"
+   *     is a fraction of the image width, and this image is 3.5 times wider
+   *
+   * Because the plate now covers the screen one-to-one, every displacement
+   * measured in image UV is worth about 2.8x more screen pixels horizontally
+   * than it was on the portrait plate (which only ever occupied 675 of the
+   * 1920 columns). The amplitudes below - wind, cloudDrift, cloudBillow,
+   * parallax - and the sway's horizontal frequencies were all rescaled by that
+   * factor, so the motion looks the same size on screen as it did before.
+   * swell is the exception: it divides by uImageAspect, which cancels the
+   * change on its own.
+   *
+   * That rescaling was arithmetically right and perceptually wrong. Matching
+   * the portrait plate's motion in screen pixels ignored that the portrait
+   * plate was a third of the width of a much busier composition; here the same
+   * absolute displacement had to be found inside a wide, calm, high-detail
+   * painting, and it disappeared. Measured against captures five seconds apart
+   * the foreground meadow was moving about a pixel and a half, the cumulus
+   * about half a pixel, and the reasonable report from across a room was that
+   * nothing was animating at all.
+   *
+   * So the defaults were recalibrated by eye rather than by arithmetic. The
+   * grass carries the scene at roughly three times the amplitude, but the
+   * larger part of the change is CONTRAST rather than size: uGustDepth leaves
+   * the meadow nearly still between fronts so that a gust arriving every
+   * fifteen seconds is an event. The clouds gained speed rather than travel,
+   * because travel is what shears them. And two of the dead zones turned out to
+   * be structural rather than a matter of amplitude - a sky band that stopped
+   * above the largest cloud mass in the painting, and a depth ramp steep enough
+   * to freeze the middle distance - so those were fixed where they were broken.
+   *
+   * What moves, and what decides it:
+   *
+   *   - the cumulus towers drift very slowly, gated on BRIGHTNESS so the flat
+   *     blue between them stays put. living.html's trick. The gate is read from
+   *     a heavily blurred mip (uCloudLod) rather than the sharp plate, because a
+   *     hard-edged mask makes a discontinuous sampling offset and a
+   *     discontinuous offset is a tear - red-cloud-shore refused to gate its sky
+   *     at all for exactly that reason. Blurring the mask over ~16 image pixels
+   *     turns what would be a hairline into the billowing the cumulus wants
+   *     anyway
+   *   - below uHorizon the grass and the wildflowers sway on a travelling
+   *     sum-of-sines, amplitude growing toward the bottom of the frame because
+   *     foreground plants are nearer and larger. Which pixels count as plant is
+   *     decided by the plate's own colour: see vegetation()
+   *   - the Jeep is olive green and sits in the middle of that meadow, so it
+   *     gets an explicit exclusion rectangle on top of the colour gate. Inside
+   *     uJeep the total displacement is multiplied by exactly zero, so the Jeep
+   *     samples the undisplaced plate and is provably still - see stillGuard()
+   *   - the sea gets a small travelling swell, and the painted surf along the
+   *     cliff base breathes: a slow phase brightens paint that is already pale,
+   *     so the foam lace lights up in advancing bands instead of stripes
+   *     appearing in flat turquoise
+   *
+   * uHorizon has two jobs and this composition puts them in different places.
+   * The sea's horizon - the line the water actually ends at - is at y 0.646,
+   * measured off the plate; the highest vegetation, the far headland on the
+   * right, starts around y 0.53. One number has to serve both, and it is the
+   * sea that constrains it: the sky above the waterline is BLUER than the water
+   * (b - g runs 0.17 up there against the sea's 0.09 to 0.19), so the colour
+   * gate cannot tell them apart and seaDepth's taper is the only thing keeping
+   * the swell out of the sky. uHorizon 0.6 puts that taper's foot at 0.61, so
+   * the waterline itself is still moving at a seventh of amplitude - a fifth of
+   * a screen pixel - and the sky above it at effectively nothing, while the
+   * grass ramp still starts high enough to cover the whole near meadow.
+   *   - gulls cross the upper sky in ones and twos on a 2D overlay, with quiet
+   *     gaps between flights
+   *   - white butterflies work the wildflower slope on the same overlay, each
+   *     one wandering a bounded path around its own patch, and drifting seed
+   *     fluff crosses the near meadow below them. Neither is gated on the
+   *     plate's colour the way the shader effects are, so both are kept inside
+   *     explicit bands - and both are tested against the Jeep before they draw,
+   *     because the overlay paints OVER the shader and stillGuard cannot reach
+   *     it
+   *
+   * There is deliberately NO global brightness shimmer here, unlike the living
+   * images. A whole-frame breath moves every pixel including the Jeep, and "the
+   * Jeep never moves" is the one promise this wallpaper makes.
+   *
+   * Every tuning number is a property in wallpaper.json.
+   */
+
+  const errorBox = document.getElementById('error');
+  const glCanvas = document.getElementById('gl');
+  const fxCanvas = document.getElementById('fx');
+
+  function fail(message) {
+    errorBox.textContent = message;
+    errorBox.style.display = 'grid';
+  }
+
+  const VERT = `#version 300 es
+  in vec2 aPos;
+  out vec2 vUv;
+  void main() {
+    // Y is flipped so uv.y = 0 is the TOP of both the screen and the texture.
+    // The texture half of that comes from uploading with UNPACK_FLIP_Y off,
+    // which puts the image's first row at t = 0. Every horizon test below
+    // depends on this convention.
+    vUv = vec2(aPos.x * 0.5 + 0.5, 0.5 - aPos.y * 0.5);
+    gl_Position = vec4(aPos, 0.0, 1.0);
+  }`;
+
+  const FRAG = `#version 300 es
+  precision highp float;
+
+  in vec2 vUv;
+  out vec4 fragColor;
+
+  uniform sampler2D uImage;
+  uniform vec2  uResolution;
+  uniform float uImageAspect;
+
+  /**
+   * There is no clock uniform here on purpose.
+   *
+   * This wallpaper runs for weeks at a time, and a float32 holding the elapsed
+   * seconds loses its grip long before that: one ULP at 24 hours is already
+   * 8 ms, half a frame, so the motion starts advancing in visible steps. So
+   * every phase is accumulated on the CPU in double precision, reduced modulo
+   * two pi there, and arrives here already small. What is left in the shader is
+   * purely spatial. The handful of components that depend on nothing but time -
+   * the cloud drift, the gust set size, the surf breath - are evaluated on the
+   * CPU outright and arrive as plain values.
+   */
+  uniform vec4  uWindT;        // phases: gust, gust harmonic, sway 1, sway 2
+  uniform vec4  uSeaT;         // phase: sway 3, swell, swell long wave, surf band
+  uniform vec4  uCloudT;       // value: drift x, drift y; phase: billow 1, billow 2
+  uniform vec2  uSlow;         // value: gust set size, surf breath
+
+  // --- framing ---
+  uniform int   uFit;          // 0 cover, 1 contain, 2 blur-fill
+  uniform vec2  uFocus;        // the point a cover crop keeps
+  uniform float uBlurLod;      // mip the gutter blow-up is read from
+  uniform float uBlurDim;
+  uniform float uBlurDesat;
+
+  // --- masks ---
+  uniform float uMaskLod;      // mip the vegetation and sea gates read
+  uniform float uCloudLod;     // ... and the cloud gate, which needs to be softer
+  uniform float uHorizon;      // image Y where vegetation starts
+
+  // --- grass ---
+  uniform float uWind;         // sway amplitude, in image UV
+  uniform float uWindDepth;    // exponent on the near-far amplitude ramp
+  uniform vec2  uVegGate;      // g - b range that counts as plant
+  uniform vec2  uVegWarm;      // g - r range: the sandy track fails this
+  uniform vec2  uGustDir;      // unit direction gust fronts travel
+  uniform float uGustK;        // 2 pi / gust wavelength
+  uniform float uGustDepth;    // 0 steady breeze, 1 dead calm between hard gusts
+  uniform vec4  uJeep;         // x0, y0, x1, y1 in image UV: nothing moves in here
+  uniform float uJeepFeather;
+
+  // --- sea ---
+  uniform vec2  uSwellDir;     // unit travel direction, points at the cliff
+  uniform float uSwell;
+  uniform float uSwellK;       // 2 pi / swell wavelength
+  uniform float uSurfK;        // 2 pi / surf-band wavelength
+  uniform float uSurfGain;
+  uniform vec2  uWaterEdge;    // image X where the sea gate fades out
+  uniform vec2  uSeaGate;      // b - g range that counts as water
+  uniform vec2  uSeaLum;       // luminance that separates sea from shadowed rock
+  uniform vec2  uFoamLum;      // luminance that counts as painted foam
+
+  // --- clouds ---
+  // The drift amplitude itself is folded into uCloudT on the CPU, so there is
+  // no uCloudDrift uniform here.
+  uniform float uCloudBillow;
+  uniform vec2  uCloudLum;     // blurred luminance: blue sky -> cumulus
+  uniform vec2  uSkyFade;      // image Y where the sky band fades out, over LAND
+  uniform vec2  uSkySeaFade;   // ... and the much lower one out over the water
+  uniform vec2  uSkySplit;     // image X the two fade profiles cross over between
+
+  // --- grading ---
+  uniform float uParallax;
+  uniform vec2  uCursor;
+  uniform float uVignette;
+  uniform float uSaturate;
+  uniform float uBrightness;
+
+  /** Screen UV -> image UV for a cover (crop) fit. */
+  vec2 coverUv(vec2 uv) {
+    float screenAspect = uResolution.x / uResolution.y;
+    vec2 scale = screenAspect > uImageAspect
+      ? vec2(1.0, uImageAspect / screenAspect)
+      : vec2(screenAspect / uImageAspect, 1.0);
+    return (uv - 0.5) * scale + uFocus;
+  }
+
+  /** Screen UV -> image UV for a contain (letterbox) fit. */
+  vec2 containUv(vec2 uv) {
+    float screenAspect = uResolution.x / uResolution.y;
+    vec2 scale = screenAspect > uImageAspect
+      ? vec2(screenAspect / uImageAspect, 1.0)
+      : vec2(1.0, uImageAspect / screenAspect);
+    return (uv - 0.5) * scale + 0.5;
+  }
+
+  float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+
+  /**
+   * How much this pixel behaves as grass or wildflower.
+   *
+   * Two channel-order tests, both measured off this plate at uMaskLod rather
+   * than guessed - the numbers below are what the shader actually reads, which
+   * is not what an eyedropper on the sharp file reports.
+   *
+   * g - b sorts vegetation - 0.21 in the wildflower patches, 0.28 in the near
+   * slope, 0.32 in the far meadow - from the sea (-0.09) and the sky. It also
+   * puts the Jeep at 0.027, which is below the gate on its own; the rectangle
+   * further down is belt and braces for its lit edges and the mip bleed off the
+   * grass behind it.
+   *
+   * The one thing g - b cannot separate is the sandy track, which at 0.23 is
+   * every bit as green-over-blue as the grass. g - r finishes it: the road is
+   * warm paint and runs +0.04 where the meadow runs +0.27 to +0.32. That is a
+   * narrower margin than the portrait plate had, which is why uVegWarm starts
+   * at 0.05 here instead of 0.02.
+   */
+  float vegetation(vec3 c) {
+    return smoothstep(uVegGate.x, uVegGate.y, c.g - c.b)
+         * smoothstep(uVegWarm.x, uVegWarm.y, c.g - c.r);
+  }
+
+  /**
+   * How much this pixel behaves as sea.
+   *
+   * b - g is the mirror of the vegetation test and separates water (0.16 out
+   * deep, 0.09 inshore) from grass and sand, both of which sit at -0.22 or
+   * lower. What it cannot separate is the sea stacks standing IN the water:
+   * blue-grey rock averages 0.005 and reaches 0.09, right inside the water's
+   * range, so the gate starts at 0.04 to cut the bulk of it and the luminance
+   * term takes the rest - the stacks and the foreground boulders bottom out
+   * around 0.15 to 0.25 luma where open water never goes below 0.37.
+   *
+   * uWaterEdge is the third term and does the job colour cannot. The coastline
+   * runs diagonally - measured off the plate it passes (0.41, 0.62), (0.31,
+   * 0.83) and (0.14, 0.94) - so there is no vertical line that has water on one
+   * side and land on the other. The cut at 0.34 to 0.44 is placed instead to
+   * fade out over the limestone cliff face, whose shadowed paint is genuinely
+   * sea-coloured (b - g 0.08, luma 0.48) and would otherwise swell.
+   */
+  float seaness(vec3 c, float x) {
+    float cool = smoothstep(uSeaGate.x, uSeaGate.y, c.b - c.g);
+    float lit = smoothstep(uSeaLum.x, uSeaLum.y, luma(c));
+    float offshore = 1.0 - smoothstep(uWaterEdge.x, uWaterEdge.y, x);
+    return cool * lit * offshore;
+  }
+
+  /**
+   * Zero inside the Jeep's rectangle, one outside it, feathered between.
+   *
+   * The whole displacement is multiplied by this, so inside the rectangle the
+   * fragment samples the plate at exactly the coordinate it was handed and the
+   * Jeep cannot move by so much as a fraction of a pixel. The feather matters
+   * as much as the rectangle: a hard edge would shear the grass along the
+   * Jeep's outline, and at uJeepFeather the neighbouring grass is displaced by
+   * well under a pixel where it meets the paintwork.
+   */
+  float stillGuard(vec2 iuv) {
+    // Do not call the half-extent "half" - that is a reserved word in GLSL ES 3
+    // and the shader will not compile.
+    vec2 centre = (uJeep.xy + uJeep.zw) * 0.5;
+    vec2 reach = (uJeep.zw - uJeep.xy) * 0.5;
+    vec2 d = abs(iuv - centre) - reach;
+    return smoothstep(0.0, uJeepFeather, max(d.x, d.y));
+  }
+
+  void main() {
+    vec2 parallax = (uCursor - 0.5) * uParallax;
+    vec2 iuv = (uFit == 0 ? coverUv(vUv) : containUv(vUv)) + parallax * vec2(1.0, 0.6);
+
+    // Aspect-true space. Gust and swell headings are measured off the plate in
+    // pixels, and only mean anything once x has been stretched by the aspect -
+    // this plate is 1.6 wide for its height, so the error is more than half a
+    // right angle. Normalising by the HEIGHT like this is also why gustLength,
+    // swellLength and surfLength survived the change of plate untouched: one
+    // aspect-true unit is one screen height either way.
+    vec2 p = vec2(iuv.x * uImageAspect, iuv.y);
+
+    vec2 clamped = clamp(iuv, 0.0, 1.0);
+    vec3 blur = textureLod(uImage, clamped, uMaskLod).rgb;
+    float veg = vegetation(blur);
+    float sea = seaness(blur, iuv.x);
+    float still = stillGuard(iuv);
+
+    // --- clouds -----------------------------------------------------------
+    // Read from its own, much blurrier mip: this gate multiplies a sampling
+    // offset, so how fast it can change across the screen is how much shear it
+    // puts into the cloud edge. Sixteen image pixels of transition is slow
+    // enough to read as billowing.
+    float cloudness = smoothstep(uCloudLum.x, uCloudLum.y, luma(textureLod(uImage, clamped, uCloudLod).rgb));
+
+    // The sky does not end at one height. Out to the left it runs all the way
+    // down to the sea horizon at 0.646; on the right the far hills cut it off at
+    // 0.471, and the cloud gate - which only knows about brightness - cannot
+    // tell a sunlit ridge from a cumulus core. A single cut has to satisfy the
+    // right-hand case, and that is what froze the entire lower cloud bank over
+    // the water: it sits at y 0.50 to 0.60, below the old 0.47 cut, so the
+    // largest single mass of cloud in the painting never moved at all. Sliding
+    // the cut along with the land it is protecting frees that bank while still
+    // keeping the drift off the ridge line.
+    vec2 skyFade = mix(uSkySeaFade, uSkyFade, smoothstep(uSkySplit.x, uSkySplit.y, iuv.x));
+    float skyBand = 1.0 - smoothstep(skyFade.x, skyFade.y, iuv.y);
+
+    // The drift itself is two slow sines at an awkward ratio, evaluated on the
+    // CPU. Sines rather than a constant velocity, so the sky can never walk off
+    // the edge of the texture however long this has been running; awkward
+    // ratio, so it has no period short enough to notice.
+    vec2 cloudOff = uCloudT.xy;
+    // A touch of low-frequency warp so the towers billow instead of sliding
+    // rigidly. Kept far below the drift, or the outline starts to boil.
+    cloudOff += vec2(
+      sin(iuv.y * 7.1 + uCloudT.z),
+      sin(iuv.x * 5.3 - uCloudT.w) * 0.5
+    ) * uCloudBillow;
+    cloudOff *= skyBand * cloudness;
+
+    // --- grass ------------------------------------------------------------
+    // Amplitude grows toward the bottom of the frame: the tufts by the camera
+    // are a few metres away and the meadow on the far headland is a kilometre,
+    // and the same physical sway is worth a hundred times more pixels near.
+    float depth = clamp((iuv.y - uHorizon) / max(0.0001, 1.0 - uHorizon), 0.0, 1.0);
+
+    // One ramp along the gust direction, so the meadow ripples in sequence
+    // rather than in lockstep - a front crosses the frame and the grass it has
+    // already passed is still settling.
+    //
+    // uGustDepth is the contrast between a gust and the lull behind it, and it
+    // is what makes the meadow read as weather rather than as a machine. At 0
+    // the whole field sways at one steady rate, which the eye files away as
+    // texture within a second or two and stops seeing. Pushing the floor down
+    // and the crest up leaves the grass nearly still between fronts, so when one
+    // does arrive there is something to notice. The mean is deliberately held
+    // near where it was: this buys contrast, not more wind.
+    float gustRamp = dot(p, uGustDir) * uGustK;
+    float gust = max(0.0, (1.0 - uGustDepth)
+               + uGustDepth * (0.5 + 0.5 * sin(gustRamp - uWindT.x))
+               + uGustDepth * 0.26 * sin(gustRamp * 0.43 - uWindT.y + 1.7));
+
+    // Three travelling waves at unrelated frequencies. One alone reads as the
+    // whole meadow waving in time with itself.
+    //
+    // These are in image UV, which is not square on screen, so the x terms had
+    // to be rescaled with the plate: on the portrait plate one UV of x was 675
+    // screen pixels and here it is 1920. Left at the old 22 / 13 / 31 the
+    // crests flattened out to sixteen degrees off horizontal and the meadow
+    // rippled in wide horizontal slabs. At 62 / 37 / 88 they sit back at forty
+    // degrees, which is the grain the sway had before.
+    float sway = sin(iuv.y * 46.0 + iuv.x * 62.0 + uWindT.z)
+               + 0.55 * sin(iuv.y * 88.0 - iuv.x * 37.0 - uWindT.w + 1.7)
+               + 0.30 * sin(iuv.x * 88.0 + uSeaT.x);
+
+    // uWindDepth decides how far up the slope the sway survives. The ramp is
+    // the honest one - near grass really does move more - but raised to 1.4 it
+    // left everything above the foreground strip visually dead: at y 0.65 the
+    // factor is 0.05, so the mid meadow got a twentieth of the amplitude and
+    // simply did not read. Nearer 1 the falloff is still there and the far
+    // headland still sits at a fraction of a pixel, but the middle distance
+    // rejoins the picture.
+    float amp = uWind * pow(depth, uWindDepth) * veg * gust * uSlow.x * 0.5;
+    // Mostly lateral; a little vertical keeps it from reading as a shear.
+    vec2 grassOff = vec2(sway * amp, sway * amp * 0.22);
+
+    // --- sea --------------------------------------------------------------
+    // Taper in below the waterline: the flat band of sea right at the horizon
+    // is a couple of pixels of paint standing in for several kilometres, and
+    // moving it at all looks broken.
+    float seaDepth = smoothstep(uHorizon + 0.01, uHorizon + 0.16, iuv.y);
+    float ramp = dot(p, uSwellDir);
+    // The companion term is a LONGER wave, not a harmonic. Steepness is
+    // amplitude times wavenumber, and a harmonic multiplies it by its own
+    // ratio; once that passes one the displacement folds the plate back over
+    // itself and the painted swell shreds.
+    float swell = sin(ramp * uSwellK + uSeaT.y) + 0.30 * sin(ramp * uSwellK * 0.53 + uSeaT.z + 2.2);
+    vec2 seaOff = uSwellDir * (swell * uSwell * sea * seaDepth);
+    seaOff.x /= uImageAspect;
+
+    vec3 color = texture(uImage, clamp(iuv + (grassOff + seaOff + cloudOff) * still, 0.0, 1.0)).rgb;
+
+    // Surf, modulated rather than drawn. Gating on paint that is already pale
+    // lights the printed foam lace one band at a time and leaves the flat
+    // turquoise between the bands alone, which is what keeps this looking like
+    // the painting it is. uSlow.y breathes the whole surf line on a slower
+    // cycle again, so the shore swells and settles.
+    float foam = smoothstep(uFoamLum.x, uFoamLum.y, luma(color)) * sea * seaDepth * still;
+    float breath = 0.5 + 0.5 * sin(ramp * uSurfK + uSeaT.w);
+    color = mix(color, min(color * 1.14 + vec3(0.05, 0.06, 0.06), vec3(1.0)),
+                foam * uSurfGain * breath * uSlow.y);
+
+    // --- framing ----------------------------------------------------------
+    if (uFit != 0) {
+      // Both non-cropping fits need something in the gutters. contain gets
+      // black; blur-fill gets a cover-scaled blow-up of the plate itself, read
+      // straight out of the mip chain. Just under LOD 6 keeps the painting's
+      // teal-left, green-right weight without any of its detail: LOD 5 still
+      // shows the mip's own texel grid as soft quadrilaterals, and LOD 6 flat
+      // is one muddy colour. The parallax on the gutters is deliberately a
+      // third of the foreground's, which is what sells the two as one scene.
+      vec3 backdrop = vec3(0.0);
+      if (uFit == 2) {
+        backdrop = textureLod(uImage, clamp(coverUv(vUv) + parallax * 0.35, 0.0, 1.0), uBlurLod).rgb;
+        backdrop = mix(backdrop, vec3(luma(backdrop)), uBlurDesat) * uBlurDim;
+      }
+      vec2 edge = min(iuv, 1.0 - iuv);
+      color = mix(backdrop, color, smoothstep(0.0, 0.006, min(edge.x, edge.y)));
+    }
+
+    color *= uBrightness;
+    color = mix(vec3(luma(color)), color, uSaturate);
+
+    float vig = 1.0 - uVignette * pow(length((vUv - 0.5) * vec2(1.05, 1.0)) * 1.32, 2.4);
+    color *= clamp(vig, 0.0, 1.0);
+
+    fragColor = vec4(color, 1.0);
+  }`;
+
+  function compile(gl, type, source) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      throw new Error(gl.getShaderInfoLog(shader) || 'shader compile failed');
+    }
+    return shader;
+  }
+
+  function buildProgram(gl) {
+    const program = gl.createProgram();
+    gl.attachShader(program, compile(gl, gl.VERTEX_SHADER, VERT));
+    gl.attachShader(program, compile(gl, gl.FRAGMENT_SHADER, FRAG));
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      throw new Error(gl.getProgramInfoLog(program) || 'program link failed');
+    }
+    return program;
+  }
+
+  function loadImage(src) {
+    return new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = () => reject(new Error(`Could not load ${src}`));
+      image.src = src;
+    });
+  }
+
+  const FIT_MODES = { cover: 0, contain: 1, blur: 2 };
+  const MAX_FLOCK = 3;
+  const TAU2 = Math.PI * 2;
+
+  // Warm paint for the small life. Alpha is applied through ctx.globalAlpha
+  // rather than baked into these strings, so the draw loop never builds one.
+  const WING_PALE = 'rgb(255, 248, 228)';
+  const WING_WARM = 'rgb(255, 234, 166)';
+  const WING_BODY = 'rgba(86, 70, 42, 0.8)';
+  const MOTE_PX = 32;
+
+  /** A soft dot of pollen, drawn once at boot and blitted from then on. */
+  function makeMoteSprite() {
+    const sprite = document.createElement('canvas');
+    sprite.width = MOTE_PX;
+    sprite.height = MOTE_PX;
+    const g = sprite.getContext('2d');
+    const mid = MOTE_PX / 2;
+    // A gradient object per frame would be garbage; one for the lifetime of the
+    // wallpaper is free, and drawImage of a premultiplied sprite is cheaper than
+    // filling an arc anyway.
+    const grad = g.createRadialGradient(mid, mid, 0, mid, mid, mid);
+    grad.addColorStop(0, 'rgba(255, 253, 236, 1)');
+    grad.addColorStop(0.3, 'rgba(255, 246, 206, 0.46)');
+    grad.addColorStop(1, 'rgba(255, 242, 190, 0)');
+    g.fillStyle = grad;
+    g.fillRect(0, 0, MOTE_PX, MOTE_PX);
+    return sprite;
+  }
+
+  /**
+   * Gulls over the headland, drawn on a 2D overlay above the shader.
+   *
+   * They are occasional on purpose. A fixed set of birds circling forever is
+   * the thing that gives an animated wallpaper away, so this runs FLIGHTS: a
+   * flight waits out a random gap of half a minute or so, crosses the sky as
+   * one, two or three birds holding a loose formation, and goes quiet again.
+   * With the default two flights the sky is empty most of the time.
+   *
+   * Every bird object is allocated once, at boot, and reused for every flight
+   * it takes part in - this loop runs 24/7 and must not produce garbage.
+   *
+   * Positions are in PLATE UV, not screen UV, so the birds stay in the sky of
+   * the painting whichever fit is in use; toScreen() is the inverse of whatever
+   * mapping the shader applied. They fade at the plate's edges rather than
+   * being clipped, because a crisp gull over the blurred gutter reads as a bug.
+   */
+  function createOverlay(canvas, props, num, pair, quad, imageAspect) {
+    const ctx = canvas.getContext('2d');
+    const flightCount = Math.max(0, Math.round(num(props.birds, 2)));
+    const gap = pair(props.birdGap, 14, 38);
+    const band = pair(props.birdBand, 0.1, 0.38);
+    // Speeds are in plate UV per second, so a flight takes the same TIME to
+    // cross whatever the plate is. On this one that would mean a gull tearing
+    // across at 73 screen pixels a second against the portrait plate's 26, so
+    // the multiplier is under one: the wider the vista, the longer a bird
+    // moving at a given speed should take to get through it.
+    const speedMul = num(props.birdSpeed, 0.55);
+    const sizeMul = num(props.birdSize, 1.25);
+
+    const flyCount = Math.max(0, Math.round(num(props.butterflies, 4)));
+    // The flowery slope to the right of the track, and clear of the Jeep, which
+    // ends at x 0.593. Butterflies would not actually avoid a dirt road, but
+    // starting the band past its right edge keeps them among the wildflowers
+    // they are supposed to be working.
+    const flyBand = quad(props.butterflyBand, 0.64, 0.73, 0.99, 0.94);
+    const flySize = num(props.butterflySize, 1);
+    const flySpeed = num(props.butterflySpeed, 1);
+
+    const moteCount = Math.max(0, Math.round(num(props.motes, 22)));
+    // The band's top edge is what keeps the pollen off the Jeep, which ends at
+    // 0.852; its bottom edge stops short of 1.0 because a 16:9 screen crops the
+    // last five percent of this plate away and motes below that are paid for and
+    // never seen. It starts at x 0.3 because the bottom-left corner of this
+    // plate is open water, and pollen over the sea is nobody's summer afternoon.
+    const moteBand = quad(props.moteBand, 0.3, 0.862, 0.99, 0.962);
+    const moteSize = num(props.moteSize, 1);
+    const moteSpeed = num(props.moteSpeed, 1);
+
+    // The overlay draws over the shader's output, so nothing it puts on the
+    // screen is covered by stillGuard. If a butterfly wandered across the
+    // bodywork the Jeep would move - a wing over a wing mirror is a changed
+    // pixel, and "the Jeep never moves" would stop being true. The default bands
+    // are placed clear of it, but a band is a property and a property can be set
+    // to anything, so the exclusion is enforced here rather than assumed.
+    const jeepUv = quad(props.jeep, 0.454, 0.677, 0.593, 0.852);
+    const jeepBox = { x0: 0, y0: 0, x1: 0, y1: 0 };
+
+    let width = 1;
+    let height = 1;
+    let fit = FIT_MODES.blur;
+    let focusX = 0.5;
+    let focusY = 0.5;
+
+    const rand = (a, b) => a + Math.random() * (b - a);
+    const wrapTau = (x) => x - TAU2 * Math.floor(x / TAU2);
+    const flights = [];
+    const butterflies = [];
+    const motes = [];
+    const moteSprite = moteCount > 0 ? makeMoteSprite() : null;
+
+    for (let i = 0; i < flightCount; i++) {
+      const members = [];
+      for (let m = 0; m < MAX_FLOCK; m++) {
+        members.push({ dx: 0, dy: 0, scale: 1, flap: 0, flapRate: 5 });
+      }
+      // Staggered, so two flights configured together do not launch together.
+      flights.push({
+        active: false,
+        timer: rand(2, gap[1]),
+        dir: 1,
+        count: 1,
+        x: 0,
+        y: 0,
+        scale: 1,
+        speed: 0,
+        bob: 0,
+        members
+      });
+    }
+
+    /**
+     * Butterflies over the wildflower slope.
+     *
+     * Unlike the gulls these never leave, because on a summer afternoon they
+     * would not: each one keeps to a patch and works it. So there is no flight
+     * or respawn logic at all, just a closed Lissajous path around a home point
+     * - two sines in x at unrelated rates, one in y - which wanders convincingly
+     * and, more to the point, is BOUNDED. rx and ry are trimmed to whatever room
+     * the home point has inside the band, so a butterfly cannot drift out of the
+     * flowers however long this runs.
+     *
+     * The flap is the part that sells it. A butterfly's wings are nearly
+     * invisible edge-on and broad at the top of the stroke, so the silhouette
+     * pulses between a sliver and a full pair twelve times a second, and the
+     * alpha pulses with it. That flicker is what the eye catches from across a
+     * room; the wandering is what it finds when it looks.
+     */
+    for (let i = 0; i < flyCount; i++) {
+      const hx = rand(flyBand[0] + 0.02, flyBand[2] - 0.02);
+      const hy = rand(flyBand[1] + 0.01, flyBand[3] - 0.01);
+      // 1.45 is the path's excursion per unit of rx: sin + 0.45 sin.
+      const roomX = Math.min(hx - flyBand[0], flyBand[2] - hx) / 1.45;
+      const roomY = Math.min(hy - flyBand[1], flyBand[3] - hy);
+      butterflies.push({
+        hx,
+        hy,
+        rx: Math.min(rand(0.035, 0.085), roomX),
+        ry: Math.min(rand(0.012, 0.026), roomY),
+        p1: rand(0, TAU2),
+        p2: rand(0, TAU2),
+        p3: rand(0, TAU2),
+        r1: rand(0.15, 0.26) * flySpeed,
+        r2: rand(0.4, 0.62) * flySpeed,
+        r3: rand(0.28, 0.47) * flySpeed,
+        flap: rand(0, TAU2),
+        flapRate: rand(9, 13.5) * flySpeed,
+        scale: rand(0.8, 1.2),
+        tone: i % 3 === 0 ? WING_WARM : WING_PALE
+      });
+    }
+
+    /**
+     * Dandelion seed and pollen over the near meadow, lit from behind.
+     *
+     * These drift with the wind rather than around a home point, so they do run
+     * off the end of the band - and are recycled in place when they do, which is
+     * the only way a 24/7 loop can have moving particles without allocating. The
+     * rise is a twentieth of the travel: enough that the field does not read as
+     * a conveyor belt, not so much that everything exits through the top.
+     */
+    for (let i = 0; i < moteCount; i++) {
+      const vx = rand(0.007, 0.017) * moteSpeed;
+      motes.push({
+        // Spread along the band at boot, or the first minute is an empty meadow
+        // followed by a wall of pollen arriving from the left together.
+        x: rand(moteBand[0], moteBand[2]),
+        y: rand(moteBand[1], moteBand[3]),
+        vx,
+        vy: -vx * 0.05,
+        ph: rand(0, TAU2),
+        phRate: rand(0.5, 1.2) * moteSpeed,
+        wob: rand(0.002, 0.006),
+        // Radius as a fraction of screen height, so a mote is the same size on
+        // any monitor. These are three times the size the arithmetic suggests,
+        // and the reason is camouflage rather than brightness: this meadow is
+        // already painted full of small white daisies, so a small pale dot is
+        // just another one of them however carefully it is lit. What separates a
+        // mote from a flower is that it is bigger and soft-edged, and at a third
+        // of this size they were measurable in the deltas and invisible on the
+        // screen.
+        r: rand(0.008, 0.0165),
+        a: rand(0.45, 0.95),
+        fade: 0
+      });
+    }
+
+    function recycleMote(mote) {
+      mote.x = moteBand[0] - 0.02;
+      mote.y = rand(moteBand[1] + (moteBand[3] - moteBand[1]) * 0.35, moteBand[3]);
+      mote.ph = rand(0, TAU2);
+    }
+
+    function launch(flight) {
+      flight.active = true;
+      flight.dir = Math.random() < 0.5 ? 1 : -1;
+      flight.x = flight.dir > 0 ? -0.1 : 1.1;
+      flight.y = rand(band[0], band[1]);
+      // Smaller birds read as further away, so they also cross more slowly.
+      flight.scale = rand(0.45, 1.0);
+      flight.speed = (0.012 + flight.scale * 0.026) * speedMul;
+      flight.bob = Math.random() * Math.PI * 2;
+      // Singles most of the time, pairs often, a three only now and then.
+      const roll = Math.random();
+      flight.count = roll < 0.5 ? 1 : roll < 0.88 ? 2 : 3;
+      for (let i = 0; i < flight.count; i++) {
+        const bird = flight.members[i];
+        // Trailing birds sit behind and a little above or below the leader.
+        bird.dx = i === 0 ? 0 : -flight.dir * rand(0.035, 0.085) * i;
+        bird.dy = i === 0 ? 0 : rand(-0.022, 0.022);
+        bird.scale = i === 0 ? 1 : rand(0.78, 0.98);
+        bird.flap = Math.random() * Math.PI * 2;
+        bird.flapRate = rand(2.4, 3.8);
+      }
+    }
+
+    // Scratch, so neither resize nor the draw loop allocates.
+    const point = [0, 0];
+
+    function resize(w, h, fitMode, focus) {
+      width = w;
+      height = h;
+      fit = fitMode;
+      focusX = focus[0];
+      focusY = focus[1];
+      toScreen(jeepUv[0], jeepUv[1], point);
+      jeepBox.x0 = point[0];
+      jeepBox.y0 = point[1];
+      toScreen(jeepUv[2], jeepUv[3], point);
+      jeepBox.x1 = point[0];
+      jeepBox.y1 = point[1];
+    }
+
+    /** True when a sprite of radius r at (x, y) cannot touch the Jeep. */
+    function clearsJeep(x, y, r) {
+      return x + r < jeepBox.x0 || x - r > jeepBox.x1
+          || y + r < jeepBox.y0 || y - r > jeepBox.y1;
+    }
+
+    /** Image UV -> screen pixels: the inverse of the shader's fit. */
+    function toScreen(ix, iy, out) {
+      const screenAspect = width / height;
+      const wide = screenAspect > imageAspect;
+      let sx;
+      let sy;
+      if (fit === FIT_MODES.cover) {
+        sx = wide ? 1 : screenAspect / imageAspect;
+        sy = wide ? imageAspect / screenAspect : 1;
+        out[0] = ((ix - focusX) / sx + 0.5) * width;
+        out[1] = ((iy - focusY) / sy + 0.5) * height;
+      } else {
+        sx = wide ? screenAspect / imageAspect : 1;
+        sy = wide ? 1 : imageAspect / screenAspect;
+        out[0] = ((ix - 0.5) / sx + 0.5) * width;
+        out[1] = ((iy - 0.5) / sy + 0.5) * height;
+      }
+    }
+
+    function update(dt) {
+      for (const flight of flights) {
+        if (!flight.active) {
+          flight.timer -= dt;
+          if (flight.timer <= 0) launch(flight);
+          continue;
+        }
+        flight.x += flight.dir * flight.speed * dt;
+        flight.bob += dt * 0.55;
+        for (let i = 0; i < flight.count; i++) {
+          flight.members[i].flap += flight.members[i].flapRate * dt;
+        }
+        if (flight.x < -0.22 || flight.x > 1.22) {
+          flight.active = false;
+          flight.timer = rand(gap[0], gap[1]);
+        }
+      }
+
+      // Every phase is wrapped as it is advanced, for the same reason the
+      // shader's are: this loop runs for weeks, and a float that has been
+      // accumulating since Tuesday makes a poor argument to a sine.
+      for (const fly of butterflies) {
+        fly.p1 = wrapTau(fly.p1 + fly.r1 * dt);
+        fly.p2 = wrapTau(fly.p2 + fly.r2 * dt);
+        fly.p3 = wrapTau(fly.p3 + fly.r3 * dt);
+        fly.flap = wrapTau(fly.flap + fly.flapRate * dt);
+      }
+
+      const moteSpan = Math.max(0.0001, moteBand[2] - moteBand[0]);
+      for (const mote of motes) {
+        mote.x += mote.vx * dt;
+        mote.y += mote.vy * dt;
+        mote.ph = wrapTau(mote.ph + mote.phRate * dt);
+        if (mote.x > moteBand[2] + 0.02 || mote.y < moteBand[1] - 0.01) recycleMote(mote);
+        // Fade in off the left edge and out at the right, so nothing appears or
+        // vanishes in open meadow.
+        const along = (mote.x - moteBand[0]) / moteSpan;
+        mote.fade = Math.max(0, Math.min(1, Math.min(along, 1 - along) / 0.12));
+      }
+    }
+
+    function drawBird(ix, iy, size, alpha, flap) {
+      toScreen(ix, iy, point);
+      const x = point[0];
+      const y = point[1];
+      // Wings sweep from a shallow V to a deeper one: the classic two-arc gull.
+      // The sweep is shallower than the one in red-cloud-shore because these
+      // birds are gliding on a thermal over a headland rather than working
+      // their way across open water.
+      const lift = Math.sin(flap);
+      const span = size * (0.88 + 0.18 * lift);
+      const drop = size * (0.4 - 0.4 * lift);
+
+      ctx.beginPath();
+      ctx.moveTo(x - span, y + drop);
+      ctx.quadraticCurveTo(x - span * 0.42, y - size * 0.42, x, y);
+      ctx.quadraticCurveTo(x + span * 0.42, y - size * 0.42, x + span, y + drop);
+      ctx.lineWidth = Math.max(1, size * 0.2);
+      ctx.strokeStyle = `rgba(24, 40, 58, ${alpha})`;
+      ctx.lineCap = 'round';
+      ctx.stroke();
+    }
+
+    /**
+     * One butterfly: two wing pairs and a body, mirrored about the flight line.
+     *
+     * The span is the whole animation. At the bottom of the stroke the wings are
+     * edge-on and the shape collapses to a bright sliver; at the top they are
+     * fully spread. Drawing both sides from the same shoulder point keeps the
+     * two halves joined however far apart they swing.
+     */
+    function drawButterfly(x, y, size, span, alpha, tone) {
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = tone;
+      ctx.beginPath();
+      ctx.moveTo(x, y - size * 0.34);
+      ctx.quadraticCurveTo(x - span * 1.25, y - size * 1.02, x - span * 1.02, y - size * 0.12);
+      ctx.quadraticCurveTo(x - span * 0.9, y + size * 0.74, x - span * 0.16, y + size * 0.32);
+      ctx.closePath();
+      ctx.moveTo(x, y - size * 0.34);
+      ctx.quadraticCurveTo(x + span * 1.25, y - size * 1.02, x + span * 1.02, y - size * 0.12);
+      ctx.quadraticCurveTo(x + span * 0.9, y + size * 0.74, x + span * 0.16, y + size * 0.32);
+      ctx.closePath();
+      ctx.fill();
+
+      ctx.beginPath();
+      ctx.moveTo(x, y - size * 0.4);
+      ctx.lineTo(x, y + size * 0.34);
+      ctx.lineWidth = Math.max(1, size * 0.22);
+      ctx.strokeStyle = WING_BODY;
+      ctx.stroke();
+    }
+
+    function draw() {
+      ctx.clearRect(0, 0, width, height);
+      ctx.globalAlpha = 1;
+
+      // Pollen first, underneath everything else that shares the ground.
+      //
+      // Drawn rather than added. Additive was the obvious choice and it was
+      // wrong: the meadow is sunlit green sitting near the top of its channel,
+      // so adding warm light to it moved the pixel by almost nothing and the
+      // motes were visible only where they happened to cross a shaded rock. A
+      // painter faced with the same problem paints the seed head in, and that is
+      // what the soft warm dot below is.
+      if (moteSprite) {
+        for (const mote of motes) {
+          if (mote.fade <= 0) continue;
+          toScreen(mote.x, mote.y + Math.sin(mote.ph) * mote.wob, point);
+          const r = mote.r * height * moteSize;
+          if (!clearsJeep(point[0], point[1], r)) continue;
+          ctx.globalAlpha = mote.a * mote.fade;
+          ctx.drawImage(moteSprite, point[0] - r, point[1] - r, r * 2, r * 2);
+        }
+      }
+
+      for (const fly of butterflies) {
+        const ix = fly.hx + Math.sin(fly.p1) * fly.rx + Math.sin(fly.p2) * fly.rx * 0.45;
+        // The flap lifts the whole insect as well as spreading the wings, which
+        // is the bobbing that makes a butterfly look like nothing else.
+        const lift = Math.abs(Math.sin(fly.flap));
+        const iy = fly.hy + Math.sin(fly.p3) * fly.ry - lift * 0.0035;
+        toScreen(ix, iy, point);
+        const size = fly.scale * height * 0.0105 * flySize;
+        if (!clearsJeep(point[0], point[1], size * 1.4)) continue;
+        drawButterfly(point[0], point[1], size, size * (0.24 + 0.76 * lift),
+          0.9 * (0.45 + 0.55 * lift), fly.tone);
+      }
+
+      ctx.globalAlpha = 1;
+      for (const flight of flights) {
+        if (!flight.active) continue;
+        for (let i = 0; i < flight.count; i++) {
+          const bird = flight.members[i];
+          const ix = flight.x + bird.dx;
+          // Fade at the plate's edges instead of clipping there.
+          const edge = Math.min(ix, 1 - ix);
+          if (edge < -0.04) continue;
+          const fade = Math.min(1, Math.max(0, (edge + 0.04) / 0.1));
+          const iy = flight.y + bird.dy + Math.sin(flight.bob + i) * 0.006;
+          const size = flight.scale * bird.scale * height * 0.011 * sizeMul;
+          drawBird(ix, iy, size, fade * (0.34 + flight.scale * 0.42), bird.flap);
+        }
+      }
+    }
+
+    return { resize, update, draw };
+  }
+
+  async function boot() {
+    const config = await window.wallpaperForge.getConfig();
+    if (!config || !config.wallpaper) return fail('No wallpaper assigned.');
+    const props = config.wallpaper.properties || {};
+    const num = (value, fallback) => (Number.isFinite(Number(value)) ? Number(value) : fallback);
+    const pair = (value, a, b) => {
+      const v = Array.isArray(value) ? value : [];
+      return [num(v[0], a), num(v[1], b)];
+    };
+    const quad = (value, a, b, c, d) => {
+      const v = Array.isArray(value) ? value : [];
+      return [num(v[0], a), num(v[1], b), num(v[2], c), num(v[3], d)];
+    };
+
+    const gl = glCanvas.getContext('webgl2', {
+      antialias: false,
+      alpha: false,
+      powerPreference: 'low-power'
+    });
+    if (!gl) return fail('WebGL2 is not available on this machine.');
+
+    const image = await loadImage(props.plate || 'media/plate.png');
+    const program = buildProgram(gl);
+    gl.useProgram(program);
+
+    const buffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+    const aPos = gl.getAttribLocation(program, 'aPos');
+    gl.enableVertexAttribArray(aPos);
+    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+    const texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false); // uv.y = 0 is the top of the image
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    // Every mask and the whole blurred gutter are read through textureLod, so
+    // the mip chain is load bearing here, not an anti-aliasing convenience.
+    gl.generateMipmap(gl.TEXTURE_2D);
+
+    const imageAspect = image.width / image.height;
+    const u = (name) => gl.getUniformLocation(program, name);
+    const uResolution = u('uResolution');
+    const uCursor = u('uCursor');
+    const uWindT = u('uWindT');
+    const uSeaT = u('uSeaT');
+    const uCloudT = u('uCloudT');
+    const uSlow = u('uSlow');
+
+    const fit = FIT_MODES[props.fit] ?? FIT_MODES.cover;
+    // 0.5 is not a lazy default: see the note at the top of the file about what
+    // any other value does once the plate and the screen share an aspect.
+    const focus = pair(props.focus, 0.5, 0.5);
+    const gustAngle = (num(props.gustAngle, 335) * Math.PI) / 180;
+    // Re-measured off the landscape plate. The coastline's lower run goes from
+    // (0.40, 0.72) to (0.14, 0.94), which in aspect-true space puts its
+    // landward normal at 63 degrees; the upper run, past the sea stacks, gives
+    // 55. The swell comes in across the middle of that at 62, where 90 would be
+    // straight down the screen.
+    const swellAngle = (num(props.swellAngle, 62) * Math.PI) / 180;
+    const gustK = (Math.PI * 2) / Math.max(0.05, num(props.gustLength, 0.55));
+    const swellK = (Math.PI * 2) / Math.max(0.02, num(props.swellLength, 0.14));
+    const surfK = (Math.PI * 2) / Math.max(0.02, num(props.surfLength, 0.1));
+
+    // Rates, kept on this side of the wire because every phase they drive is
+    // accumulated and wrapped here rather than in the shader.
+    const windSpeed = num(props.windSpeed, 1);
+    const gustSpeed = num(props.gustSpeed, 0.26);
+    const swellSpeed = num(props.swellSpeed, 0.038);
+    const surfSpeed = num(props.surfSpeed, 0.03);
+    const cloudDrift = num(props.cloudDrift, 0.0062);
+    // Cloud motion is a rate problem, not an amplitude problem, and the two are
+    // not interchangeable here. The drift is a sine, so its amplitude is how far
+    // the towers travel and these two multipliers are how fast they get there.
+    // Amplitude is the term that has to stay small: the gate transitions over
+    // roughly sixteen image pixels, and an offset much larger than that stretches
+    // the cloud edge instead of moving it. So the visible speed is bought on the
+    // frequency side, where it costs nothing but a shorter cycle.
+    const cloudDriftSpeed = num(props.cloudDriftSpeed, 1.9);
+    const cloudBillowSpeed = num(props.cloudBillowSpeed, 2.1);
+
+    const vegGate = pair(props.vegGate, 0.06, 0.2);
+    const vegWarm = pair(props.vegWarm, 0.05, 0.16);
+    const waterEdge = pair(props.waterEdge, 0.34, 0.44);
+    const seaGate = pair(props.seaGate, 0.04, 0.12);
+    const seaLum = pair(props.seaLum, 0.28, 0.4);
+    const foamLum = pair(props.foamLum, 0.6, 0.88);
+    const cloudLum = pair(props.cloudLum, 0.62, 0.88);
+    // The sky band has to stop before the highest land, or the cloud gate -
+    // which only knows about brightness - starts dragging the ridge line with
+    // it: at uCloudLod the far hills bleed up to 0.74 luma against the cumulus
+    // cores' 0.78. The ridge is at y 0.471 on this plate, so the band is gone
+    // by 0.47. That also keeps the drift off the sea horizon at 0.646 and the
+    // pale haze above it.
+    const skyFade = pair(props.skyFade, 0.36, 0.47);
+    // Out over the water there is no ridge to protect, only the sea horizon at
+    // 0.646 and the pale haze stacked above it. Stopping at 0.62 keeps the whole
+    // lower cloud bank inside the moving band and the waterline outside it -
+    // whitecaps are bright enough to satisfy the cloud gate, and dragging them
+    // sideways with the sky would look like a bug. The crossover window is the
+    // stretch of x where the far coastline climbs out of the sea.
+    const skySeaFade = pair(props.skySeaFade, 0.52, 0.62);
+    const skySplit = pair(props.skySplit, 0.3, 0.62);
+    // Measured off the plate with a flood fill seeded in the spare wheel: the
+    // Jeep's paintwork spans x 0.4619 to 0.5850 and y 0.6852 to 0.8442, front
+    // fender flare to rear bumper tip, roof to the bottom of the near rear
+    // tyre. Padded by about eight thousandths so its lit edges are inside too.
+    const jeep = quad(props.jeep, 0.454, 0.677, 0.593, 0.852);
+
+    gl.uniform1i(u('uImage'), 0);
+    gl.uniform1f(u('uImageAspect'), imageAspect);
+
+    gl.uniform1i(u('uFit'), fit);
+    gl.uniform2f(u('uFocus'), focus[0], focus[1]);
+    gl.uniform1f(u('uBlurLod'), num(props.blurLod, 7.6));
+    gl.uniform1f(u('uBlurDim'), num(props.blurDim, 0.68));
+    gl.uniform1f(u('uBlurDesat'), num(props.blurDesat, 0.14));
+
+    gl.uniform1f(u('uMaskLod'), num(props.maskLod, 3));
+    gl.uniform1f(u('uCloudLod'), num(props.cloudLod, 4.5));
+    gl.uniform1f(u('uHorizon'), num(props.horizon, 0.6));
+
+    gl.uniform1f(u('uWind'), num(props.wind, 0.0052));
+    gl.uniform1f(u('uWindDepth'), Math.max(0.2, num(props.windDepth, 1.05)));
+    gl.uniform2f(u('uVegGate'), vegGate[0], vegGate[1]);
+    gl.uniform2f(u('uVegWarm'), vegWarm[0], vegWarm[1]);
+    gl.uniform2f(u('uGustDir'), Math.cos(gustAngle), Math.sin(gustAngle));
+    gl.uniform1f(u('uGustK'), gustK);
+    gl.uniform1f(u('uGustDepth'), Math.max(0, Math.min(1, num(props.gustDepth, 0.72))));
+    gl.uniform4f(u('uJeep'), jeep[0], jeep[1], jeep[2], jeep[3]);
+    // The feather is in UV, so it is nearly twice as wide as it is tall once it
+    // reaches the screen. What matters is not its width but the GRADIENT across
+    // it: the grass goes from still to full amplitude over this distance, and
+    // that ratio is how much the paint beside the Jeep is stretched. Raising the
+    // wind raises the numerator, so the feather has to widen with it or a smear
+    // appears along the bodywork. 0.024 is 46 screen pixels either side and 29
+    // above and below.
+    gl.uniform1f(u('uJeepFeather'), Math.max(0.0001, num(props.jeepFeather, 0.024)));
+
+    gl.uniform2f(u('uSwellDir'), Math.cos(swellAngle), Math.sin(swellAngle));
+    gl.uniform1f(u('uSwell'), num(props.swell, 0.0021));
+    gl.uniform1f(u('uSwellK'), swellK);
+    gl.uniform1f(u('uSurfK'), surfK);
+    gl.uniform1f(u('uSurfGain'), num(props.surfGain, 0.44));
+    gl.uniform2f(u('uWaterEdge'), waterEdge[0], waterEdge[1]);
+    gl.uniform2f(u('uSeaGate'), seaGate[0], seaGate[1]);
+    gl.uniform2f(u('uSeaLum'), seaLum[0], seaLum[1]);
+    gl.uniform2f(u('uFoamLum'), foamLum[0], foamLum[1]);
+
+    gl.uniform1f(u('uCloudBillow'), num(props.cloudBillow, 0.0034));
+    gl.uniform2f(u('uCloudLum'), cloudLum[0], cloudLum[1]);
+    gl.uniform2f(u('uSkyFade'), skyFade[0], skyFade[1]);
+    gl.uniform2f(u('uSkySeaFade'), skySeaFade[0], skySeaFade[1]);
+    gl.uniform2f(u('uSkySplit'), skySplit[0], skySplit[1]);
+
+    // Small on purpose now that cover crops nothing: at a 16:10 plate on a
+    // 16:10 screen there is no margin to slide into, so anything larger just
+    // clamps a smeared column against the left or right edge. 0.002 is a
+    // pixel and a half at full cursor deflection.
+    const parallax = num(props.parallax, 0.002);
+    gl.uniform1f(u('uParallax'), parallax);
+    gl.uniform1f(u('uVignette'), num(props.vignette, 0.05));
+    gl.uniform1f(u('uSaturate'), num(props.saturate, 1));
+    gl.uniform1f(u('uBrightness'), num(props.brightness, 1));
+
+    const overlay = createOverlay(fxCanvas, props, num, pair, quad, imageAspect);
+    const cursorEnabled = parallax !== 0;
+    const smoothCursor = { x: 0.5, y: 0.5 };
+
+    function resize() {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const w = Math.max(1, Math.round(window.innerWidth * dpr));
+      const h = Math.max(1, Math.round(window.innerHeight * dpr));
+      for (const canvas of [glCanvas, fxCanvas]) {
+        canvas.width = w;
+        canvas.height = h;
+      }
+      gl.viewport(0, 0, w, h);
+      gl.uniform2f(uResolution, w, h);
+      overlay.resize(w, h, fit, focus);
+    }
+    resize();
+    window.addEventListener('resize', resize);
+
+    let raf = null;
+    let last = performance.now();
+    let clock = 0;
+
+    // Reduce a phase to [0, 2 pi). Done here, in double precision, so the value
+    // the shader receives is small however long this has been running - see the
+    // note above the uniform block.
+    const TAU = Math.PI * 2;
+    const wrap = (x) => x - TAU * Math.floor(x / TAU);
+
+    function frame(now) {
+      raf = requestAnimationFrame(frame);
+      const dt = Math.min(0.05, (now - last) / 1000);
+      last = now;
+      clock += dt;
+
+      if (cursorEnabled) {
+        const { cursor } = window.wallpaperForge.frame();
+        // Ease toward the pointer so the parallax glides instead of snapping.
+        smoothCursor.x += (cursor.x - smoothCursor.x) * Math.min(1, dt * 2);
+        smoothCursor.y += (cursor.y - smoothCursor.y) * Math.min(1, dt * 2);
+      }
+
+      const t = clock;
+      gl.uniform4f(
+        uWindT,
+        wrap(t * gustSpeed),
+        wrap(t * gustSpeed * 0.43),
+        wrap(t * windSpeed * 2.1),
+        wrap(t * windSpeed * 3.3)
+      );
+      gl.uniform4f(
+        uSeaT,
+        wrap(t * windSpeed * 1.3),
+        wrap(t * swellSpeed * swellK),
+        wrap(t * swellSpeed * swellK * 0.53),
+        wrap(t * surfSpeed * surfK)
+      );
+
+      // The cloud drift depends on nothing but time, so it is evaluated here
+      // outright rather than per pixel: more accurate, and free. A summer
+      // afternoon's worth of speed - the primary sine takes two and a half
+      // minutes to come back round, and the towers travel about a dozen screen
+      // pixels end to end, which is a cumulus edge visibly shifting if you watch
+      // it and nothing at all if you glance.
+      gl.uniform4f(
+        uCloudT,
+        (Math.sin(wrap(t * 0.021 * cloudDriftSpeed)) * 0.62
+          + Math.sin(wrap(t * 0.0131 * cloudDriftSpeed) + 1.9) * 0.38) * cloudDrift,
+        Math.sin(wrap(t * 0.017 * cloudDriftSpeed) + 0.6) * cloudDrift * 0.22,
+        wrap(t * 0.055 * cloudBillowSpeed),
+        wrap(t * 0.041 * cloudBillowSpeed)
+      );
+
+      // Two more whole-frame quantities: how hard this run of gusts is blowing,
+      // and how far up the surf line the foam has come.
+      gl.uniform2f(
+        uSlow,
+        0.72 + 0.18 * Math.sin(wrap(t * 0.037)) + 0.1 * Math.sin(wrap(t * 0.0231) + 2.1),
+        0.55 + 0.45 * Math.sin(wrap(t * 0.085))
+      );
+
+      gl.uniform2f(uCursor, smoothCursor.x, smoothCursor.y);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+      overlay.update(dt);
+      overlay.draw();
+    }
+
+    function start() {
+      if (raf !== null) return;
+      last = performance.now();
+      raf = requestAnimationFrame(frame);
+    }
+    function stop() {
+      if (raf === null) return;
+      cancelAnimationFrame(raf);
+      raf = null;
+    }
+
+    // This runs 24/7 behind the desktop: a rAF loop left alive while paused
+    // burns CPU forever.
+    window.wallpaperForge.onPause((paused) => {
+      if (paused) stop();
+      else start();
+    });
+
+    if (!window.wallpaperForge.isPaused()) start();
+  }
+
+  boot().catch((err) => fail(String(err && err.message ? err.message : err)));
+</script>
