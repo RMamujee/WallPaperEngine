@@ -48,10 +48,7 @@ function bootstrap() {
   tray.create({ onOpenPicker: () => picker.open(), onApplySettings: applySettings });
   registerIpc();
 
-  app.setLoginItemSettings({
-    openAtLogin: !!config.get('launchOnStartup'),
-    args: ['--hidden']
-  });
+  app.setLoginItemSettings(loginItemSettings(config.get('launchOnStartup')));
 
   // Launching from the desktop/Start-menu icon should show the library. Only
   // the autostart entry passes --hidden, so login stays silent.
@@ -62,6 +59,20 @@ function bootstrap() {
   );
 }
 
+/**
+ * Unpackaged, process.execPath is electron.exe itself, which boots Electron's
+ * stock welcome app unless the project directory is its first argument — so a
+ * bare `electron.exe --hidden` autostart shows an empty "Electron" window at
+ * login and never renders a wallpaper. No manual quoting: setLoginItemSettings
+ * quotes each arg itself, and pre-quoted values end up as literal quote
+ * characters in the registry command line.
+ */
+function loginItemSettings(openAtLogin) {
+  const args = app.isPackaged ? [] : [app.getAppPath()];
+  args.push('--hidden');
+  return { openAtLogin: !!openAtLogin, args };
+}
+
 function applySettings(patch) {
   config.set(patch);
 
@@ -70,7 +81,7 @@ function applySettings(patch) {
     else audio.stop();
   }
   if ('launchOnStartup' in patch) {
-    app.setLoginItemSettings({ openAtLogin: !!patch.launchOnStartup, args: ['--hidden'] });
+    app.setLoginItemSettings(loginItemSettings(patch.launchOnStartup));
   }
   if ('volume' in patch) {
     desktop.setVolume(patch.volume);
